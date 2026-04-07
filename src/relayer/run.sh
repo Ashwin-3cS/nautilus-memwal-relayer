@@ -44,9 +44,11 @@ setup_outbound_proxy() {
 }
 
 # ── Networking ───────────────────────────────────────────────────────────────
-busybox ip addr add 127.0.0.1/32 dev lo
+busybox ip addr add 127.0.0.1/8 dev lo
 busybox ip link set dev lo up
 echo "127.0.0.1   localhost" > /etc/hosts
+echo "loopback check:"
+busybox ip addr show lo
 
 # ── Enclave mode ─────────────────────────────────────────────────────────────
 export ENCLAVE_MODE=true

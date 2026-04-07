@@ -292,6 +292,10 @@ jobs:
             unset IFS
           fi
 
+          # Truncate log files so we only see the latest run's output
+          sudo systemctl stop nautilus-logs.service nautilus-sidecar-logs.service 2>/dev/null || true
+          sudo truncate -s 0 /tmp/enclave.log /tmp/sidecar.log 2>/dev/null || true
+
           sudo systemctl daemon-reload
           sudo systemctl enable --now \
             nautilus-bridge.service \
