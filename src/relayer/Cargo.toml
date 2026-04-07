@@ -49,7 +49,7 @@ walrus_rs = "0.1"
 futures = "0.3"
 
 # Rate limiting (Redis-backed)
-redis = { version = "0.27", features = ["tokio-comp"] }
+redis = { version = "0.27", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls", "tls-rustls-webpki-roots"] }
 
 # Utils
 uuid = { version = "1", features = ["v4"] }
