@@ -186,8 +186,10 @@ echo "memwal relay server started: PID $SERVER_PID"
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 trap 'kill $SERVER_PID 2>/dev/null; exit 0' TERM INT
 
+set +e
 wait $SERVER_PID
 SERVER_EXIT=$?
+set -e
 echo "── memwal_server exited with code: $SERVER_EXIT ──"
 echo "── /tmp/server.log (direct dump to serial console) ──"
 cat /tmp/server.log 2>/dev/null || echo "(server.log missing)"
