@@ -125,12 +125,19 @@ jobs:
             sudo systemctl stop "$svc.service" 2>/dev/null || true
           done
           sudo nitro-cli terminate-enclave --all || true
-          # Reconfigure allocator now that no enclaves are running
+          # Give the kernel a moment to re-online CPUs before touching the allocator
+          sleep 5
+          # Update allocator config and restart with retries
           ALLOC=/etc/nitro_enclaves/allocator.yaml
-          sudo sed -i "s/memory_mib:.*/memory_mib: 6144/" "$ALLOC" || true
-          sudo sed -i "s/cpu_count:.*/cpu_count: 2/"    "$ALLOC" || true
+          sudo sed -i "s/memory_mib:.*/memory_mib: 6144/" "$ALLOC"
+          sudo sed -i "s/cpu_count:.*/cpu_count: 2/"    "$ALLOC"
           sudo systemctl enable nitro-enclaves-allocator.service || true
-          sudo systemctl restart nitro-enclaves-allocator.service || true
+          for attempt in 1 2 3; do
+            sudo systemctl restart nitro-enclaves-allocator.service && break
+            echo "Allocator restart attempt $attempt failed, retrying in 5s..."
+            sleep 5
+          done
+          sudo systemctl is-active nitro-enclaves-allocator.service
           REMOTE
           rm -f /tmp/deploy_key
 
