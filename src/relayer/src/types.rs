@@ -67,6 +67,12 @@ pub struct Config {
     pub memwal_account_id: Option<String>,
     pub openai_api_key: Option<String>,
     pub openai_api_base: String,
+    /// Embedding provider (falls back to openai_api_* if not set)
+    pub embedding_api_key: Option<String>,
+    pub embedding_api_base: Option<String>,
+    pub embedding_model: String,
+    pub embedding_dimensions: Option<u32>,
+    pub llm_model: String,
     pub walrus_publisher_url: String,
     pub walrus_aggregator_url: String,
     /// Primary key (used for SEAL decrypt / recall). Unchanged.
@@ -105,6 +111,15 @@ impl Config {
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             openai_api_base: std::env::var("OPENAI_API_BASE")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+            embedding_api_key: std::env::var("EMBEDDING_API_KEY").ok(),
+            embedding_api_base: std::env::var("EMBEDDING_API_BASE").ok(),
+            embedding_model: std::env::var("EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "openai/text-embedding-3-small".to_string()),
+            embedding_dimensions: std::env::var("EMBEDDING_DIMENSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            llm_model: std::env::var("LLM_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-4o-mini".to_string()),
             walrus_publisher_url: std::env::var("WALRUS_PUBLISHER_URL")
                 .unwrap_or_else(|_| "https://publisher.walrus-mainnet.walrus.space".to_string()),
             walrus_aggregator_url: std::env::var("WALRUS_AGGREGATOR_URL")

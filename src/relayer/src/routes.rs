@@ -33,6 +33,8 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 struct EmbeddingApiRequest {
     model: String,
     input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
 }
 
 /// OpenAI-compatible embedding response
@@ -47,66 +49,55 @@ struct EmbeddingData {
 }
 
 /// Generate an embedding vector from text.
-/// Uses OpenRouter/OpenAI API when OPENAI_API_KEY is set, mock otherwise.
+/// Uses EMBEDDING_API_* if set, falls back to OPENAI_API_*.
+/// Sends request without Authorization header when no key is configured (Jina free tier).
 async fn generate_embedding(
     client: &reqwest::Client,
     config: &Config,
     text: &str,
 ) -> Result<Vec<f32>, AppError> {
-    match &config.openai_api_key {
-        Some(api_key) => {
-            // Real embedding via OpenRouter/OpenAI-compatible API
-            let url = format!("{}/embeddings", config.openai_api_base);
+    // Resolve embedding provider — EMBEDDING_* takes priority over OPENAI_*
+    let api_key = config.embedding_api_key.as_ref().or(config.openai_api_key.as_ref());
+    let api_base = config.embedding_api_base.as_deref()
+        .unwrap_or(&config.openai_api_base);
 
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&EmbeddingApiRequest {
-                    model: "openai/text-embedding-3-small".to_string(),
-                    input: text.to_string(),
-                })
-                .send()
-                .await
-                .map_err(|e| AppError::Internal(format!("Embedding API request failed: {}", e)))?;
+    let url = format!("{}/embeddings", api_base);
+    let mut req = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&EmbeddingApiRequest {
+            model: config.embedding_model.clone(),
+            input: text.to_string(),
+            dimensions: config.embedding_dimensions,
+        });
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(AppError::Internal(format!(
-                    "Embedding API error ({}): {}", status, body
-                )));
-            }
-
-            let api_resp: EmbeddingApiResponse = resp.json().await.map_err(|e| {
-                AppError::Internal(format!("Failed to parse embedding response: {}", e))
-            })?;
-
-            let vector = api_resp.data
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Internal("Embedding API returned no data".into()))?
-                .embedding;
-            Ok(vector)
-        }
-        None => {
-            // Mock embedding (deterministic hash-based)
-            tracing::warn!("  → Using MOCK embedding (no OPENAI_API_KEY set)");
-            use sha2::Digest;
-            let hash = sha2::Sha256::digest(text.as_bytes());
-            let mock_vector: Vec<f32> = hash
-                .iter()
-                .cycle()
-                .take(1536)
-                .enumerate()
-                .map(|(i, &b)| {
-                    let val = (b as f32 / 255.0) * 2.0 - 1.0;
-                    val * (1.0 + (i as f32 * 0.001).sin())
-                })
-                .collect();
-            Ok(mock_vector)
-        }
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {}", key));
     }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Embedding API request failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Embedding API error ({}): {}", status, body
+        )));
+    }
+
+    let api_resp: EmbeddingApiResponse = resp.json().await.map_err(|e| {
+        AppError::Internal(format!("Failed to parse embedding response: {}", e))
+    })?;
+
+    let vector = api_resp.data
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Internal("Embedding API returned no data".into()))?
+        .embedding;
+    Ok(vector)
 }
 
 // ============================================================
@@ -550,7 +541,7 @@ async fn extract_facts_llm(
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&ChatCompletionRequest {
-            model: "openai/gpt-4o-mini".to_string(),
+            model: config.llm_model.clone(),
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
@@ -718,7 +709,7 @@ pub async fn ask(
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&ChatCompletionRequest {
-            model: "openai/gpt-4o-mini".to_string(),
+            model: state.config.llm_model.clone(),
             messages: vec![
                 ChatMessage { role: "system".to_string(), content: system_prompt },
                 ChatMessage { role: "user".to_string(), content: body.question.clone() },
