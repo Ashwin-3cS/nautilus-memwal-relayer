@@ -24,7 +24,7 @@ FROM stagex/user-socat@sha256:91cd7505fb97593e5790bdbb0ca62d5fd2bae0d70fda025d46
 # and extract just the node binary + standard libraries needed by tsx.
 FROM debian:bookworm-slim AS node-build
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-        curl ca-certificates xz-utils \
+        curl ca-certificates xz-utils musl \
     && rm -rf /var/lib/apt/lists/*
 # Node 22 LTS official musl build (x64)
 ARG NODE_VERSION=22.13.1
