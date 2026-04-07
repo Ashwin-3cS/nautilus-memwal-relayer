@@ -366,18 +366,18 @@ jobs:
           SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
           $SSH 'bash -s' << 'REMOTE'
           set -e
-          # Give the relay server a moment to boot after config
-          sleep 5
-          for i in $(seq 1 12); do
+          # Wait for full startup: sidecar poll (15s) + DB connect + Redis connect can take ~90s
+          sleep 10
+          for i in $(seq 1 24); do
             if curl -sf http://localhost:4000/health > /dev/null 2>&1; then
               echo "Health check passed"
               curl -s http://localhost:4000/health
               exit 0
             fi
-            echo "Waiting for health... (attempt $i/12)"
+            echo "Waiting for health... (attempt $i/24)"
             sleep 5
           done
-          echo "ERROR: Health check failed after 60s"
+          echo "ERROR: Health check failed after 130s"
           echo "--- Server log ---"
           tail -50 /tmp/enclave.log 2>/dev/null || true
           echo "--- Sidecar log ---"
