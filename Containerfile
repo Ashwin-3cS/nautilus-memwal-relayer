@@ -19,18 +19,12 @@ FROM stagex/linux-nitro@sha256:073c4603686e3bdc0ed6755fee3203f6f6f1512e0ded09eae
 FROM stagex/user-cpio@sha256:9802cf7909c70e779ba8fe4923b0e190241c4d6ad329f3f0720c2a7f1d97cf37 AS user-cpio
 FROM stagex/user-socat@sha256:91cd7505fb97593e5790bdbb0ca62d5fd2bae0d70fda025d46871d0a36410f7d AS user-socat
 
-# ── Node 22 musl static binary (for TS sidecar) ──────────────────────────────
-# We download the official musl-targeted Node 22 tarball in a debian builder
-# and extract just the node binary + standard libraries needed by tsx.
-FROM debian:bookworm-slim AS node-build
-RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-        curl ca-certificates xz-utils musl \
-    && rm -rf /var/lib/apt/lists/*
-# Node 22 LTS official musl build (x64)
-ARG NODE_VERSION=22.13.1
-RUN curl -fsSL "https://unofficial-builds.nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64-musl.tar.xz" \
-    | tar -xJ -C /usr/local --strip-components=1 \
-    && node --version
+# ── Node 22 musl runtime (for TS sidecar) ────────────────────────────────────
+# node:22-alpine uses musl libc, so the binary + its C++ runtime deps
+# (libstdc++.so.6, libgcc_s.so.1) are all musl-linked and can be copied
+# directly into the stagex initramfs which also runs on musl.
+FROM node:22-alpine AS node-build
+RUN node --version && npm --version
 
 # ── Workspace base (stagex) ──────────────────────────────────────────────────
 FROM scratch as base
@@ -97,9 +91,14 @@ RUN cp /src/relayer/target/${TARGET}/release/memwal_server initramfs/
 RUN cp /src/relayer/run.sh initramfs/
 
 # Node runtime + TS sidecar deps
-RUN mkdir -p initramfs/usr/local/bin initramfs/usr/local/lib initramfs/scripts
+# Copy the node binary, its musl C++ runtime libs, and the npm-installed scripts.
+# libstdc++.so.6 and libgcc_s.so.1 are the musl-linked versions from Alpine —
+# required by the node binary at runtime inside the enclave.
+RUN mkdir -p initramfs/usr/local/bin initramfs/usr/local/lib initramfs/scripts initramfs/usr/lib
 COPY --from=node-build /usr/local/bin/node initramfs/usr/local/bin/node
 COPY --from=node-build /usr/local/lib/ initramfs/usr/local/lib/
+COPY --from=node-build /usr/lib/libstdc++.so.6 initramfs/usr/lib/libstdc++.so.6
+COPY --from=node-build /usr/lib/libgcc_s.so.1 initramfs/usr/lib/libgcc_s.so.1
 COPY --from=ts-build /scripts initramfs/scripts
 
 RUN <<-EOF
