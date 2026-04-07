@@ -33,6 +33,25 @@ jobs:
           overwrite: true
           rm: false
 
+      # ── Write env file to EC2 ─────────────────────────────────────────────
+      # MEMWAL_ENV_FILE is a single GitHub secret containing the full contents
+      # of .env.memwal. Store it in Settings → Secrets → MEMWAL_ENV_FILE.
+      - name: Write env file to EC2
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+          MEMWAL_ENV_FILE: ${{ secrets.MEMWAL_ENV_FILE }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          printf '%s' "$MEMWAL_ENV_FILE" | \
+            ssh -o StrictHostKeyChecking=no \
+                -o ServerAliveInterval=30 \
+                -i /tmp/deploy_key \
+                "$EC2_USER@$EC2_HOST" \
+                "cat > ~/.env.runtime && chmod 600 ~/.env.runtime"
+          rm -f /tmp/deploy_key
+
       # ── Install deps ──────────────────────────────────────────────────────
       - name: Install dependencies
         env:
@@ -120,7 +139,8 @@ jobs:
             nautilus-outbound-postgres \
             nautilus-outbound-redis \
             nautilus-outbound-openai \
-            "nautilus-outbound-seal@*"; do
+            nautilus-outbound-embedding \
+            "nautilus-outbound-seal-*"; do
             sudo systemctl stop "$svc.service" 2>/dev/null || true
           done
           sudo nitro-cli terminate-enclave --all || true
@@ -146,124 +166,80 @@ jobs:
           REMOTE
           rm -f /tmp/deploy_key
 
-      # ── Send config + VSOCK ports into the enclave ────────────────────────
+      # ── Send config into the enclave ──────────────────────────────────────
+      # Strips comment lines and blank lines from ~/.env.runtime, then pipes
+      # the KEY=VALUE pairs to the enclave via VSOCK port 7000.
       - name: Send config to enclave
         env:
           EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
           EC2_USER: ${{ secrets.TEE_EC2_USER }}
           EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
-          # ── App secrets (set these in GitHub repo Settings → Secrets) ──────
-          PORT: ${{ secrets.MEMWAL_PORT }}
-          DATABASE_URL: ${{ secrets.MEMWAL_DATABASE_URL }}
-          REDIS_URL: ${{ secrets.MEMWAL_REDIS_URL }}
-          SUI_NETWORK: ${{ secrets.MEMWAL_SUI_NETWORK }}
-          SUI_RPC_URL: ${{ secrets.MEMWAL_SUI_RPC_URL }}
-          MEMWAL_PACKAGE_ID: ${{ secrets.MEMWAL_PACKAGE_ID }}
-          MEMWAL_REGISTRY_ID: ${{ secrets.MEMWAL_REGISTRY_ID }}
-          SEAL_KEY_SERVERS: ${{ secrets.MEMWAL_SEAL_KEY_SERVERS }}
-          SEAL_KEY_SERVER_URLS: ${{ secrets.MEMWAL_SEAL_KEY_SERVER_URLS }}
-          SERVER_SUI_PRIVATE_KEY: ${{ secrets.MEMWAL_SERVER_SUI_PRIVATE_KEY }}
-          SERVER_SUI_PRIVATE_KEYS: ${{ secrets.MEMWAL_SERVER_SUI_PRIVATE_KEYS }}
-          WALRUS_PUBLISHER_URL: ${{ secrets.MEMWAL_WALRUS_PUBLISHER_URL }}
-          WALRUS_AGGREGATOR_URL: ${{ secrets.MEMWAL_WALRUS_AGGREGATOR_URL }}
-          OPENAI_API_KEY: ${{ secrets.MEMWAL_OPENAI_API_KEY }}
-          OPENAI_API_BASE: ${{ secrets.MEMWAL_OPENAI_API_BASE }}
-          ENOKI_API_KEY: ${{ secrets.MEMWAL_ENOKI_API_KEY }}
-          # ── VSOCK port assignments (can override defaults here) ────────────
-          SUI_PROXY_VSOCK_PORT: "8101"
-          WALRUS_PUBLISHER_PROXY_VSOCK_PORT: "8102"
-          WALRUS_AGGREGATOR_PROXY_VSOCK_PORT: "8103"
-          POSTGRES_PROXY_VSOCK_PORT: "8104"
-          REDIS_PROXY_VSOCK_PORT: "8105"
-          OPENAI_PROXY_VSOCK_PORT: "8106"
-          SEAL_BASE_VSOCK_PORT: "8107"
         run: |
           echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
           SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
-          $SSH "bash -s" << REMOTE
+          $SSH 'bash -s' << 'REMOTE'
           set -e
-          CID=\$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
-          if [ -z "\$CID" ]; then echo "ERROR: Enclave not running"; exit 1; fi
+          CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
+          if [ -z "$CID" ]; then echo "ERROR: Enclave not running"; exit 1; fi
 
-          for i in \$(seq 1 10); do
-            if printf '%s\n' \
-              "PORT=${PORT}" \
-              "DATABASE_URL=${DATABASE_URL}" \
-              "REDIS_URL=${REDIS_URL}" \
-              "SUI_NETWORK=${SUI_NETWORK}" \
-              "SUI_RPC_URL=${SUI_RPC_URL}" \
-              "MEMWAL_PACKAGE_ID=${MEMWAL_PACKAGE_ID}" \
-              "MEMWAL_REGISTRY_ID=${MEMWAL_REGISTRY_ID}" \
-              "SEAL_KEY_SERVERS=${SEAL_KEY_SERVERS}" \
-              "SEAL_KEY_SERVER_URLS=${SEAL_KEY_SERVER_URLS}" \
-              "SERVER_SUI_PRIVATE_KEY=${SERVER_SUI_PRIVATE_KEY}" \
-              "SERVER_SUI_PRIVATE_KEYS=${SERVER_SUI_PRIVATE_KEYS}" \
-              "WALRUS_PUBLISHER_URL=${WALRUS_PUBLISHER_URL}" \
-              "WALRUS_AGGREGATOR_URL=${WALRUS_AGGREGATOR_URL}" \
-              "OPENAI_API_KEY=${OPENAI_API_KEY}" \
-              "OPENAI_API_BASE=${OPENAI_API_BASE}" \
-              "ENOKI_API_KEY=${ENOKI_API_KEY}" \
-              "SUI_PROXY_VSOCK_PORT=${SUI_PROXY_VSOCK_PORT}" \
-              "WALRUS_PUBLISHER_PROXY_VSOCK_PORT=${WALRUS_PUBLISHER_PROXY_VSOCK_PORT}" \
-              "WALRUS_AGGREGATOR_PROXY_VSOCK_PORT=${WALRUS_AGGREGATOR_PROXY_VSOCK_PORT}" \
-              "POSTGRES_PROXY_VSOCK_PORT=${POSTGRES_PROXY_VSOCK_PORT}" \
-              "REDIS_PROXY_VSOCK_PORT=${REDIS_PROXY_VSOCK_PORT}" \
-              "OPENAI_PROXY_VSOCK_PORT=${OPENAI_PROXY_VSOCK_PORT}" \
-              "SEAL_BASE_VSOCK_PORT=${SEAL_BASE_VSOCK_PORT}" \
-              | socat - VSOCK-CONNECT:\$CID:7000 2>/dev/null; then
-              echo "Config sent to enclave CID=\$CID"
+          for i in $(seq 1 10); do
+            if grep -v '^[[:space:]]*#' ~/.env.runtime \
+               | grep -v '^[[:space:]]*$' \
+               | socat - VSOCK-CONNECT:$CID:7000 2>/dev/null; then
+              echo "Config sent to enclave CID=$CID"
               break
             fi
-            echo "Waiting for enclave to accept config... (attempt \$i/10)"
+            echo "Waiting for enclave to accept config... (attempt $i/10)"
             sleep 3
           done
           REMOTE
           rm -f /tmp/deploy_key
 
       # ── Setup host-side VSOCK bridge + outbound systemd services ─────────
+      # Sources ~/.env.runtime (written in "Write env file" step) to read
+      # all URL values needed to create the socat systemd units.
       - name: Setup VSOCK bridge
         env:
           EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
           EC2_USER: ${{ secrets.TEE_EC2_USER }}
           EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
-          SUI_RPC_URL: ${{ secrets.MEMWAL_SUI_RPC_URL }}
-          WALRUS_PUBLISHER_URL: ${{ secrets.MEMWAL_WALRUS_PUBLISHER_URL }}
-          WALRUS_AGGREGATOR_URL: ${{ secrets.MEMWAL_WALRUS_AGGREGATOR_URL }}
-          DATABASE_URL: ${{ secrets.MEMWAL_DATABASE_URL }}
-          REDIS_URL: ${{ secrets.MEMWAL_REDIS_URL }}
-          OPENAI_API_BASE: ${{ secrets.MEMWAL_OPENAI_API_BASE }}
-          SEAL_KEY_SERVER_URLS: ${{ secrets.MEMWAL_SEAL_KEY_SERVER_URLS }}
         run: |
           echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
           SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
-          $SSH "SUI_RPC_URL='${SUI_RPC_URL}' WALRUS_PUBLISHER_URL='${WALRUS_PUBLISHER_URL}' WALRUS_AGGREGATOR_URL='${WALRUS_AGGREGATOR_URL}' DATABASE_URL='${DATABASE_URL}' REDIS_URL='${REDIS_URL}' OPENAI_API_BASE='${OPENAI_API_BASE}' SEAL_KEY_SERVER_URLS='${SEAL_KEY_SERVER_URLS}' bash -s" << 'REMOTE'
+          $SSH 'bash -s' << 'REMOTE'
           set -e
 
+          # Load all env vars from the runtime file
+          set -a
+          # shellcheck source=/dev/null
+          source ~/.env.runtime
+          set +a
+
           extract_url_host() {
-            printf '%s' "$1" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://(\[[^]]+\]|[^/:]+).*#\1#'
+            printf '%s' "$1" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://(\[[^]]+\]|[^/:@]+@)?(\[[^]]+\]|[^/:]+).*#\2#'
           }
           extract_url_port() {
             url="$1"
-            ep=$(printf '%s' "$url" | sed -nE 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/:]+:([0-9]+).*$#\1#p')
+            ep=$(printf '%s' "$url" | sed -nE 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^@]+@)?[^/:]+:([0-9]+).*$#\2#p')
             [ -n "$ep" ] && { printf '%s' "$ep"; return; }
             scheme=$(printf '%s' "$url" | sed -nE 's#^([a-zA-Z][a-zA-Z0-9+.-]*)://.*#\1#p')
-            case "$scheme" in https) printf '443';; http) printf '80';; *) printf '443';; esac
+            case "$scheme" in https|rediss) printf '443';; http|redis) printf '80';; *) printf '443';; esac
           }
 
           create_outbound_service() {
             svc="$1"; vsock_port="$2"; url="$3"
             h=$(extract_url_host "$url"); p=$(extract_url_port "$url")
             sudo tee "/etc/systemd/system/${svc}.service" > /dev/null << EOF
-          [Unit]
-          Description=${svc} (VSOCK:${vsock_port} -> ${h}:${p})
-          After=network.target
-          [Service]
-          ExecStart=/usr/bin/socat VSOCK-LISTEN:${vsock_port},fork,reuseaddr TCP:${h}:${p}
-          Restart=always
-          RestartSec=2
-          [Install]
-          WantedBy=multi-user.target
-          EOF
+[Unit]
+Description=${svc} (VSOCK:${vsock_port} -> ${h}:${p})
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat VSOCK-LISTEN:${vsock_port},fork,reuseaddr TCP:${h}:${p}
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
           }
 
           CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
@@ -271,102 +247,115 @@ jobs:
 
           # Inbound bridge: host TCP:4000 → enclave VSOCK:4000
           sudo tee /etc/systemd/system/nautilus-bridge.service > /dev/null << EOF
-          [Unit]
-          Description=Nautilus VSOCK bridge (TCP:4000 <-> VSOCK:4000)
-          After=network.target
-          [Service]
-          ExecStart=/usr/bin/socat TCP-LISTEN:4000,reuseaddr,fork VSOCK-CONNECT:$CID:4000
-          Restart=always
-          RestartSec=2
-          [Install]
-          WantedBy=multi-user.target
-          EOF
+[Unit]
+Description=Nautilus VSOCK bridge (TCP:4000 <-> VSOCK:4000)
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:4000,reuseaddr,fork VSOCK-CONNECT:${CID}:4000
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
 
-          # Log collectors
+          # Log collectors (server + sidecar)
           sudo tee /etc/systemd/system/nautilus-logs.service > /dev/null << EOF
-          [Unit]
-          Description=Nautilus server log collector (VSOCK:5000)
-          After=network.target
-          [Service]
-          ExecStart=/usr/bin/socat VSOCK-LISTEN:5000,fork,reuseaddr OPEN:/tmp/enclave.log,creat,append
-          Restart=always
-          RestartSec=2
-          [Install]
-          WantedBy=multi-user.target
-          EOF
+[Unit]
+Description=Nautilus server log collector (VSOCK:5000)
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat VSOCK-LISTEN:5000,fork,reuseaddr OPEN:/tmp/enclave.log,creat,append
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
 
           sudo tee /etc/systemd/system/nautilus-sidecar-logs.service > /dev/null << EOF
-          [Unit]
-          Description=Nautilus sidecar log collector (VSOCK:5001)
-          After=network.target
-          [Service]
-          ExecStart=/usr/bin/socat VSOCK-LISTEN:5001,fork,reuseaddr OPEN:/tmp/sidecar.log,creat,append
-          Restart=always
-          RestartSec=2
-          [Install]
-          WantedBy=multi-user.target
-          EOF
+[Unit]
+Description=Nautilus sidecar log collector (VSOCK:5001)
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat VSOCK-LISTEN:5001,fork,reuseaddr OPEN:/tmp/sidecar.log,creat,append
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
 
-          # Outbound proxies (VSOCK ports must match .env.runtime / run.sh)
-          create_outbound_service "nautilus-outbound-sui"                8101 "$SUI_RPC_URL"
-          create_outbound_service "nautilus-outbound-walrus-publisher"   8102 "$WALRUS_PUBLISHER_URL"
-          create_outbound_service "nautilus-outbound-walrus-aggregator"  8103 "$WALRUS_AGGREGATOR_URL"
+          # Outbound proxies — VSOCK port numbers come from ~/.env.runtime
+          create_outbound_service "nautilus-outbound-sui"               "${SUI_PROXY_VSOCK_PORT:-8101}"               "$SUI_RPC_URL"
+          create_outbound_service "nautilus-outbound-walrus-publisher"  "${WALRUS_PUBLISHER_PROXY_VSOCK_PORT:-8102}"  "$WALRUS_PUBLISHER_URL"
+          create_outbound_service "nautilus-outbound-walrus-aggregator" "${WALRUS_AGGREGATOR_PROXY_VSOCK_PORT:-8103}" "$WALRUS_AGGREGATOR_URL"
 
-          # Postgres (extract host:port from DATABASE_URL)
+          # Postgres — parse host:port from DATABASE_URL
           PG_HOST=$(printf '%s' "$DATABASE_URL" | sed -nE 's#^[^:]+://[^@]+@([^:/]+).*#\1#p')
           PG_PORT=$(printf '%s' "$DATABASE_URL" | sed -nE 's#^[^:]+://[^@]+@[^:]+:([0-9]+).*#\1#p')
           PG_PORT="${PG_PORT:-5432}"
-          sudo tee /etc/systemd/system/nautilus-outbound-postgres.service > /dev/null << EOF
-          [Unit]
-          Description=Nautilus outbound Postgres (VSOCK:8104 -> ${PG_HOST}:${PG_PORT})
-          After=network.target
-          [Service]
-          ExecStart=/usr/bin/socat VSOCK-LISTEN:8104,fork,reuseaddr TCP:${PG_HOST}:${PG_PORT}
-          Restart=always
-          RestartSec=2
-          [Install]
-          WantedBy=multi-user.target
-          EOF
+          POSTGRES_VSOCK="${POSTGRES_PROXY_VSOCK_PORT:-8104}"
+          sudo tee "/etc/systemd/system/nautilus-outbound-postgres.service" > /dev/null << EOF
+[Unit]
+Description=Nautilus outbound Postgres (VSOCK:${POSTGRES_VSOCK} -> ${PG_HOST}:${PG_PORT})
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat VSOCK-LISTEN:${POSTGRES_VSOCK},fork,reuseaddr TCP:${PG_HOST}:${PG_PORT}
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
 
-          # Redis (extract host:port from REDIS_URL)
-          REDIS_HOST=$(extract_url_host "$REDIS_URL")
-          REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[^:]+://[^:]+:([0-9]+).*#\1#p')
+          # Redis — parse host:port from REDIS_URL (handles rediss:// with credentials)
+          REDIS_HOST=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[a-z]+://([^:]+:)?[^@]+@([^:/@]+).*#\2#p')
+          REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#.*@[^:]+:([0-9]+).*#\1#p')
           REDIS_PORT="${REDIS_PORT:-6379}"
-          sudo tee /etc/systemd/system/nautilus-outbound-redis.service > /dev/null << EOF
-          [Unit]
-          Description=Nautilus outbound Redis (VSOCK:8105 -> ${REDIS_HOST}:${REDIS_PORT})
-          After=network.target
-          [Service]
-          ExecStart=/usr/bin/socat VSOCK-LISTEN:8105,fork,reuseaddr TCP:${REDIS_HOST}:${REDIS_PORT}
-          Restart=always
-          RestartSec=2
-          [Install]
-          WantedBy=multi-user.target
-          EOF
+          REDIS_VSOCK="${REDIS_PROXY_VSOCK_PORT:-8105}"
+          sudo tee "/etc/systemd/system/nautilus-outbound-redis.service" > /dev/null << EOF
+[Unit]
+Description=Nautilus outbound Redis (VSOCK:${REDIS_VSOCK} -> ${REDIS_HOST}:${REDIS_PORT})
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat VSOCK-LISTEN:${REDIS_VSOCK},fork,reuseaddr TCP:${REDIS_HOST}:${REDIS_PORT}
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
 
-          create_outbound_service "nautilus-outbound-openai" 8106 "$OPENAI_API_BASE"
+          create_outbound_service "nautilus-outbound-openai" "${OPENAI_PROXY_VSOCK_PORT:-8106}" "$OPENAI_API_BASE"
 
-          # SEAL key servers (comma-separated)
+          # Embedding proxy — only when EMBEDDING_API_BASE is set and differs from OPENAI_API_BASE
+          if [ -n "$EMBEDDING_API_BASE" ] && [ "$EMBEDDING_API_BASE" != "$OPENAI_API_BASE" ]; then
+            create_outbound_service "nautilus-outbound-embedding" "${EMBEDDING_PROXY_VSOCK_PORT:-8108}" "$EMBEDDING_API_BASE"
+            EMBEDDING_SVC="nautilus-outbound-embedding.service"
+          else
+            EMBEDDING_SVC=""
+          fi
+
+          # SEAL key servers (comma-separated URLs → sequential VSOCK ports from SEAL_BASE_VSOCK_PORT)
+          SEAL_BASE="${SEAL_BASE_VSOCK_PORT:-8107}"
           SEAL_IDX=0
-          IFS=','
-          for SEAL_URL in $SEAL_KEY_SERVER_URLS; do
-            VSOCK_PORT=$((8107 + SEAL_IDX))
-            SEAL_HOST=$(extract_url_host "$SEAL_URL")
-            SEAL_PORT=$(extract_url_port "$SEAL_URL")
-            sudo tee "/etc/systemd/system/nautilus-outbound-seal-${SEAL_IDX}.service" > /dev/null << EOF
-          [Unit]
-          Description=Nautilus outbound SEAL ${SEAL_IDX} (VSOCK:${VSOCK_PORT} -> ${SEAL_HOST}:${SEAL_PORT})
-          After=network.target
-          [Service]
-          ExecStart=/usr/bin/socat VSOCK-LISTEN:${VSOCK_PORT},fork,reuseaddr TCP:${SEAL_HOST}:${SEAL_PORT}
-          Restart=always
-          RestartSec=2
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-            SEAL_IDX=$((SEAL_IDX + 1))
-          done
-          unset IFS
+          if [ -n "$SEAL_KEY_SERVER_URLS" ]; then
+            IFS=','
+            for SEAL_URL in $SEAL_KEY_SERVER_URLS; do
+              VSOCK_PORT=$((SEAL_BASE + SEAL_IDX))
+              SEAL_HOST=$(extract_url_host "$SEAL_URL")
+              SEAL_PORT=$(extract_url_port "$SEAL_URL")
+              sudo tee "/etc/systemd/system/nautilus-outbound-seal-${SEAL_IDX}.service" > /dev/null << EOF
+[Unit]
+Description=Nautilus outbound SEAL ${SEAL_IDX} (VSOCK:${VSOCK_PORT} -> ${SEAL_HOST}:${SEAL_PORT})
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat VSOCK-LISTEN:${VSOCK_PORT},fork,reuseaddr TCP:${SEAL_HOST}:${SEAL_PORT}
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+              SEAL_IDX=$((SEAL_IDX + 1))
+            done
+            unset IFS
+          fi
 
           sudo systemctl daemon-reload
           sudo systemctl enable --now \
@@ -380,14 +369,18 @@ jobs:
             nautilus-outbound-redis.service \
             nautilus-outbound-openai.service
 
+          [ -n "$EMBEDDING_SVC" ] && sudo systemctl enable --now "$EMBEDDING_SVC"
+
           # Enable SEAL services dynamically
-          SEAL_IDX=0
-          IFS=','
-          for _ in $SEAL_KEY_SERVER_URLS; do
-            sudo systemctl enable --now "nautilus-outbound-seal-${SEAL_IDX}.service" || true
-            SEAL_IDX=$((SEAL_IDX + 1))
-          done
-          unset IFS
+          if [ -n "$SEAL_KEY_SERVER_URLS" ]; then
+            SEAL_IDX=0
+            IFS=','
+            for _ in $SEAL_KEY_SERVER_URLS; do
+              sudo systemctl enable --now "nautilus-outbound-seal-${SEAL_IDX}.service" || true
+              SEAL_IDX=$((SEAL_IDX + 1))
+            done
+            unset IFS
+          fi
 
           sleep 2
           sudo systemctl is-active nautilus-bridge.service

@@ -4,4 +4,5 @@ src/relayer/target/
 src/relayer/scripts/node_modules/
 .env
 .env.runtime
+.env.memwal
 *.log
