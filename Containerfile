@@ -94,7 +94,8 @@ RUN cp /src/relayer/run.sh initramfs/
 # Copy the node binary, its musl C++ runtime libs, and the npm-installed scripts.
 # libstdc++.so.6 and libgcc_s.so.1 are the musl-linked versions from Alpine —
 # required by the node binary at runtime inside the enclave.
-RUN mkdir -p initramfs/usr/local/bin initramfs/usr/local/lib initramfs/scripts initramfs/usr/lib
+RUN mkdir -p initramfs/usr/local/bin initramfs/usr/local/lib initramfs/scripts initramfs/usr/lib \
+    initramfs/proc initramfs/sys initramfs/dev initramfs/dev/pts initramfs/dev/shm initramfs/run
 COPY --from=node-build /usr/local/bin/node initramfs/usr/local/bin/node
 COPY --from=node-build /usr/local/lib/ initramfs/usr/local/lib/
 COPY --from=node-build /usr/lib/libstdc++.so.6 initramfs/usr/lib/libstdc++.so.6
