@@ -2,7 +2,8 @@
 members = [
   "src/aws",
   "src/init",
-  "src/system"
+  "src/system",
+  "src/nautilus-enclave"
 ]
 
 exclude = [

@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Nautilus TEE — attestation, ephemeral keypair, NSM entropy
-nautilus-enclave = { git = "https://github.com/Ashwin-3cS/nautilus-ops.git" }
+nautilus-enclave = { path = "../nautilus-enclave" }
 
 # Web framework
 axum = { version = "0.8", features = ["macros"] }
