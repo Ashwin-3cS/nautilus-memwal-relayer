@@ -154,7 +154,17 @@ jobs:
           sudo nitro-cli run-enclave \
             --cpu-count 2 \
             --memory 4096 \
-            --eif-path ~/nautilus-app/out/nitro.eif
+            --eif-path ~/nautilus-app/out/nitro.eif \
+            --debug-mode
+
+          # In debug mode, capture serial console output to a host file so we
+          # can see early-boot / init / run.sh failures that occur before the
+          # VSOCK log pipe is set up.
+          ENCLAVE_ID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveID')
+          sudo truncate -s 0 /tmp/enclave-console.log 2>/dev/null || true
+          nohup sudo nitro-cli console --enclave-id "$ENCLAVE_ID" \
+            > /tmp/enclave-console.log 2>&1 &
+          disown || true
           sudo nitro-cli describe-enclaves | jq -r '.[0] | "CID: \(.EnclaveCID)  State: \(.State)"'
           REMOTE
           rm -f /tmp/deploy_key
@@ -386,6 +396,8 @@ jobs:
           tail -50 /tmp/enclave.log 2>/dev/null || true
           echo "--- Sidecar log ---"
           tail -20 /tmp/sidecar.log 2>/dev/null || true
+          echo "--- Enclave console (debug-mode) ---"
+          tail -100 /tmp/enclave-console.log 2>/dev/null || true
           exit 1
           REMOTE
           rm -f /tmp/deploy_key
