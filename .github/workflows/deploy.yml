@@ -1,0 +1,428 @@
+name: Deploy Enclave
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-enclave
+  cancel-in-progress: true
+
+env:
+  APP_DIR: nautilus-app
+  ENCLAVE_CPU: 2
+  ENCLAVE_MEM: 6144   # Node + tsx + @mysten/* needs more headroom than pure Rust
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Copy source to EC2 ────────────────────────────────────────────────
+      - name: Copy source to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.TEE_EC2_HOST }}
+          username: ${{ secrets.TEE_EC2_USER }}
+          key: ${{ secrets.TEE_EC2_SSH_KEY }}
+          source: "Containerfile,src,Cargo.toml,Makefile,.gitignore"
+          target: "~/nautilus-app/"
+          overwrite: true
+          rm: false
+
+      # ── Install deps ──────────────────────────────────────────────────────
+      - name: Install dependencies
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH 'bash -s' << 'REMOTE'
+          set -e
+          if command -v dnf &> /dev/null; then PKG="sudo dnf"; else PKG="sudo yum"; fi
+          if ! command -v docker &> /dev/null; then
+            $PKG install -y docker || (curl -fsSL https://get.docker.com | sudo sh)
+            sudo systemctl start docker && sudo systemctl enable docker
+            sudo usermod -aG docker $USER
+          fi
+          if ! command -v nitro-cli &> /dev/null; then
+            $PKG install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel
+            sudo usermod -aG ne $USER
+          fi
+          command -v socat &> /dev/null || $PKG install -y socat
+          command -v jq    &> /dev/null || $PKG install -y jq
+          echo "Dependencies ready"
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Enclave allocator ─────────────────────────────────────────────────
+      - name: Configure enclave allocator
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH 'bash -s' << 'REMOTE'
+          set -e
+          ALLOC=/etc/nitro_enclaves/allocator.yaml
+          sudo sed -i "s/memory_mib:.*/memory_mib: 6144/" "$ALLOC" || true
+          sudo sed -i "s/cpu_count:.*/cpu_count: 2/"    "$ALLOC" || true
+          sudo systemctl restart nitro-enclaves-allocator.service || true
+          sudo systemctl enable  nitro-enclaves-allocator.service || true
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Build EIF on EC2 ──────────────────────────────────────────────────
+      - name: Build enclave image
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH 'bash -s' << 'REMOTE'
+          set -e
+          cd ~/nautilus-app && rm -rf out && mkdir -p out
+          sudo docker build \
+            --platform linux/amd64 \
+            --progress=plain \
+            --output type=local,dest=out/ \
+            -f Containerfile . 2>&1 | tee out/docker.log
+          echo "--- PCR Measurements ---"
+          cat out/nitro.pcrs
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Tear down old enclave ─────────────────────────────────────────────
+      - name: Terminate old enclave
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH 'bash -s' << 'REMOTE'
+          # Stop all host-side bridge/proxy services
+          for svc in \
+            nautilus-bridge nautilus-logs nautilus-sidecar-logs \
+            nautilus-outbound-sui \
+            nautilus-outbound-walrus-publisher \
+            nautilus-outbound-walrus-aggregator \
+            nautilus-outbound-postgres \
+            nautilus-outbound-redis \
+            nautilus-outbound-openai \
+            "nautilus-outbound-seal@*"; do
+            sudo systemctl stop "$svc.service" 2>/dev/null || true
+          done
+          sudo nitro-cli terminate-enclave --all || true
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Launch new enclave ────────────────────────────────────────────────
+      - name: Launch enclave
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH 'bash -s' << 'REMOTE'
+          set -e
+          sudo nitro-cli run-enclave \
+            --cpu-count 2 \
+            --memory 6144 \
+            --eif-path ~/nautilus-app/out/nitro.eif
+          sudo nitro-cli describe-enclaves | jq -r '.[0] | "CID: \(.EnclaveCID)  State: \(.State)"'
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Send config + VSOCK ports into the enclave ────────────────────────
+      - name: Send config to enclave
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+          # ── App secrets (set these in GitHub repo Settings → Secrets) ──────
+          PORT: ${{ secrets.MEMWAL_PORT }}
+          DATABASE_URL: ${{ secrets.MEMWAL_DATABASE_URL }}
+          REDIS_URL: ${{ secrets.MEMWAL_REDIS_URL }}
+          SUI_NETWORK: ${{ secrets.MEMWAL_SUI_NETWORK }}
+          SUI_RPC_URL: ${{ secrets.MEMWAL_SUI_RPC_URL }}
+          MEMWAL_PACKAGE_ID: ${{ secrets.MEMWAL_PACKAGE_ID }}
+          MEMWAL_REGISTRY_ID: ${{ secrets.MEMWAL_REGISTRY_ID }}
+          SEAL_KEY_SERVERS: ${{ secrets.MEMWAL_SEAL_KEY_SERVERS }}
+          SEAL_KEY_SERVER_URLS: ${{ secrets.MEMWAL_SEAL_KEY_SERVER_URLS }}
+          SERVER_SUI_PRIVATE_KEY: ${{ secrets.MEMWAL_SERVER_SUI_PRIVATE_KEY }}
+          SERVER_SUI_PRIVATE_KEYS: ${{ secrets.MEMWAL_SERVER_SUI_PRIVATE_KEYS }}
+          WALRUS_PUBLISHER_URL: ${{ secrets.MEMWAL_WALRUS_PUBLISHER_URL }}
+          WALRUS_AGGREGATOR_URL: ${{ secrets.MEMWAL_WALRUS_AGGREGATOR_URL }}
+          OPENAI_API_KEY: ${{ secrets.MEMWAL_OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.MEMWAL_OPENAI_API_BASE }}
+          ENOKI_API_KEY: ${{ secrets.MEMWAL_ENOKI_API_KEY }}
+          # ── VSOCK port assignments (can override defaults here) ────────────
+          SUI_PROXY_VSOCK_PORT: "8101"
+          WALRUS_PUBLISHER_PROXY_VSOCK_PORT: "8102"
+          WALRUS_AGGREGATOR_PROXY_VSOCK_PORT: "8103"
+          POSTGRES_PROXY_VSOCK_PORT: "8104"
+          REDIS_PROXY_VSOCK_PORT: "8105"
+          OPENAI_PROXY_VSOCK_PORT: "8106"
+          SEAL_BASE_VSOCK_PORT: "8107"
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH "bash -s" << REMOTE
+          set -e
+          CID=\$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
+          if [ -z "\$CID" ]; then echo "ERROR: Enclave not running"; exit 1; fi
+
+          for i in \$(seq 1 10); do
+            if printf '%s\n' \
+              "PORT=${PORT}" \
+              "DATABASE_URL=${DATABASE_URL}" \
+              "REDIS_URL=${REDIS_URL}" \
+              "SUI_NETWORK=${SUI_NETWORK}" \
+              "SUI_RPC_URL=${SUI_RPC_URL}" \
+              "MEMWAL_PACKAGE_ID=${MEMWAL_PACKAGE_ID}" \
+              "MEMWAL_REGISTRY_ID=${MEMWAL_REGISTRY_ID}" \
+              "SEAL_KEY_SERVERS=${SEAL_KEY_SERVERS}" \
+              "SEAL_KEY_SERVER_URLS=${SEAL_KEY_SERVER_URLS}" \
+              "SERVER_SUI_PRIVATE_KEY=${SERVER_SUI_PRIVATE_KEY}" \
+              "SERVER_SUI_PRIVATE_KEYS=${SERVER_SUI_PRIVATE_KEYS}" \
+              "WALRUS_PUBLISHER_URL=${WALRUS_PUBLISHER_URL}" \
+              "WALRUS_AGGREGATOR_URL=${WALRUS_AGGREGATOR_URL}" \
+              "OPENAI_API_KEY=${OPENAI_API_KEY}" \
+              "OPENAI_API_BASE=${OPENAI_API_BASE}" \
+              "ENOKI_API_KEY=${ENOKI_API_KEY}" \
+              "SUI_PROXY_VSOCK_PORT=${SUI_PROXY_VSOCK_PORT}" \
+              "WALRUS_PUBLISHER_PROXY_VSOCK_PORT=${WALRUS_PUBLISHER_PROXY_VSOCK_PORT}" \
+              "WALRUS_AGGREGATOR_PROXY_VSOCK_PORT=${WALRUS_AGGREGATOR_PROXY_VSOCK_PORT}" \
+              "POSTGRES_PROXY_VSOCK_PORT=${POSTGRES_PROXY_VSOCK_PORT}" \
+              "REDIS_PROXY_VSOCK_PORT=${REDIS_PROXY_VSOCK_PORT}" \
+              "OPENAI_PROXY_VSOCK_PORT=${OPENAI_PROXY_VSOCK_PORT}" \
+              "SEAL_BASE_VSOCK_PORT=${SEAL_BASE_VSOCK_PORT}" \
+              | socat - VSOCK-CONNECT:\$CID:7000 2>/dev/null; then
+              echo "Config sent to enclave CID=\$CID"
+              break
+            fi
+            echo "Waiting for enclave to accept config... (attempt \$i/10)"
+            sleep 3
+          done
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Setup host-side VSOCK bridge + outbound systemd services ─────────
+      - name: Setup VSOCK bridge
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+          SUI_RPC_URL: ${{ secrets.MEMWAL_SUI_RPC_URL }}
+          WALRUS_PUBLISHER_URL: ${{ secrets.MEMWAL_WALRUS_PUBLISHER_URL }}
+          WALRUS_AGGREGATOR_URL: ${{ secrets.MEMWAL_WALRUS_AGGREGATOR_URL }}
+          DATABASE_URL: ${{ secrets.MEMWAL_DATABASE_URL }}
+          REDIS_URL: ${{ secrets.MEMWAL_REDIS_URL }}
+          OPENAI_API_BASE: ${{ secrets.MEMWAL_OPENAI_API_BASE }}
+          SEAL_KEY_SERVER_URLS: ${{ secrets.MEMWAL_SEAL_KEY_SERVER_URLS }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH "SUI_RPC_URL='${SUI_RPC_URL}' WALRUS_PUBLISHER_URL='${WALRUS_PUBLISHER_URL}' WALRUS_AGGREGATOR_URL='${WALRUS_AGGREGATOR_URL}' DATABASE_URL='${DATABASE_URL}' REDIS_URL='${REDIS_URL}' OPENAI_API_BASE='${OPENAI_API_BASE}' SEAL_KEY_SERVER_URLS='${SEAL_KEY_SERVER_URLS}' bash -s" << 'REMOTE'
+          set -e
+
+          extract_url_host() {
+            printf '%s' "$1" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://(\[[^]]+\]|[^/:]+).*#\1#'
+          }
+          extract_url_port() {
+            url="$1"
+            ep=$(printf '%s' "$url" | sed -nE 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/:]+:([0-9]+).*$#\1#p')
+            [ -n "$ep" ] && { printf '%s' "$ep"; return; }
+            scheme=$(printf '%s' "$url" | sed -nE 's#^([a-zA-Z][a-zA-Z0-9+.-]*)://.*#\1#p')
+            case "$scheme" in https) printf '443';; http) printf '80';; *) printf '443';; esac
+          }
+
+          create_outbound_service() {
+            svc="$1"; vsock_port="$2"; url="$3"
+            h=$(extract_url_host "$url"); p=$(extract_url_port "$url")
+            sudo tee "/etc/systemd/system/${svc}.service" > /dev/null << EOF
+          [Unit]
+          Description=${svc} (VSOCK:${vsock_port} -> ${h}:${p})
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/socat VSOCK-LISTEN:${vsock_port},fork,reuseaddr TCP:${h}:${p}
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          }
+
+          CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
+          [ -z "$CID" ] && { echo "ERROR: no enclave CID"; exit 1; }
+
+          # Inbound bridge: host TCP:4000 → enclave VSOCK:4000
+          sudo tee /etc/systemd/system/nautilus-bridge.service > /dev/null << EOF
+          [Unit]
+          Description=Nautilus VSOCK bridge (TCP:4000 <-> VSOCK:4000)
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/socat TCP-LISTEN:4000,reuseaddr,fork VSOCK-CONNECT:$CID:4000
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # Log collectors
+          sudo tee /etc/systemd/system/nautilus-logs.service > /dev/null << EOF
+          [Unit]
+          Description=Nautilus server log collector (VSOCK:5000)
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/socat VSOCK-LISTEN:5000,fork,reuseaddr OPEN:/tmp/enclave.log,creat,append
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo tee /etc/systemd/system/nautilus-sidecar-logs.service > /dev/null << EOF
+          [Unit]
+          Description=Nautilus sidecar log collector (VSOCK:5001)
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/socat VSOCK-LISTEN:5001,fork,reuseaddr OPEN:/tmp/sidecar.log,creat,append
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # Outbound proxies (VSOCK ports must match .env.runtime / run.sh)
+          create_outbound_service "nautilus-outbound-sui"                8101 "$SUI_RPC_URL"
+          create_outbound_service "nautilus-outbound-walrus-publisher"   8102 "$WALRUS_PUBLISHER_URL"
+          create_outbound_service "nautilus-outbound-walrus-aggregator"  8103 "$WALRUS_AGGREGATOR_URL"
+
+          # Postgres (extract host:port from DATABASE_URL)
+          PG_HOST=$(printf '%s' "$DATABASE_URL" | sed -nE 's#^[^:]+://[^@]+@([^:/]+).*#\1#p')
+          PG_PORT=$(printf '%s' "$DATABASE_URL" | sed -nE 's#^[^:]+://[^@]+@[^:]+:([0-9]+).*#\1#p')
+          PG_PORT="${PG_PORT:-5432}"
+          sudo tee /etc/systemd/system/nautilus-outbound-postgres.service > /dev/null << EOF
+          [Unit]
+          Description=Nautilus outbound Postgres (VSOCK:8104 -> ${PG_HOST}:${PG_PORT})
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/socat VSOCK-LISTEN:8104,fork,reuseaddr TCP:${PG_HOST}:${PG_PORT}
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # Redis (extract host:port from REDIS_URL)
+          REDIS_HOST=$(extract_url_host "$REDIS_URL")
+          REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[^:]+://[^:]+:([0-9]+).*#\1#p')
+          REDIS_PORT="${REDIS_PORT:-6379}"
+          sudo tee /etc/systemd/system/nautilus-outbound-redis.service > /dev/null << EOF
+          [Unit]
+          Description=Nautilus outbound Redis (VSOCK:8105 -> ${REDIS_HOST}:${REDIS_PORT})
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/socat VSOCK-LISTEN:8105,fork,reuseaddr TCP:${REDIS_HOST}:${REDIS_PORT}
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          create_outbound_service "nautilus-outbound-openai" 8106 "$OPENAI_API_BASE"
+
+          # SEAL key servers (comma-separated)
+          SEAL_IDX=0
+          IFS=','
+          for SEAL_URL in $SEAL_KEY_SERVER_URLS; do
+            VSOCK_PORT=$((8107 + SEAL_IDX))
+            SEAL_HOST=$(extract_url_host "$SEAL_URL")
+            SEAL_PORT=$(extract_url_port "$SEAL_URL")
+            sudo tee "/etc/systemd/system/nautilus-outbound-seal-${SEAL_IDX}.service" > /dev/null << EOF
+          [Unit]
+          Description=Nautilus outbound SEAL ${SEAL_IDX} (VSOCK:${VSOCK_PORT} -> ${SEAL_HOST}:${SEAL_PORT})
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/socat VSOCK-LISTEN:${VSOCK_PORT},fork,reuseaddr TCP:${SEAL_HOST}:${SEAL_PORT}
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+            SEAL_IDX=$((SEAL_IDX + 1))
+          done
+          unset IFS
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now \
+            nautilus-bridge.service \
+            nautilus-logs.service \
+            nautilus-sidecar-logs.service \
+            nautilus-outbound-sui.service \
+            nautilus-outbound-walrus-publisher.service \
+            nautilus-outbound-walrus-aggregator.service \
+            nautilus-outbound-postgres.service \
+            nautilus-outbound-redis.service \
+            nautilus-outbound-openai.service
+
+          # Enable SEAL services dynamically
+          SEAL_IDX=0
+          IFS=','
+          for _ in $SEAL_KEY_SERVER_URLS; do
+            sudo systemctl enable --now "nautilus-outbound-seal-${SEAL_IDX}.service" || true
+            SEAL_IDX=$((SEAL_IDX + 1))
+          done
+          unset IFS
+
+          sleep 2
+          sudo systemctl is-active nautilus-bridge.service
+          sudo systemctl is-active nautilus-outbound-sui.service
+          echo "Bridge active: CID=$CID  TCP:4000 -> VSOCK:4000"
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Health check ──────────────────────────────────────────────────────
+      - name: Verify health
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH 'bash -s' << 'REMOTE'
+          set -e
+          # Give the relay server a moment to boot after config
+          sleep 5
+          for i in $(seq 1 12); do
+            if curl -sf http://localhost:4000/health > /dev/null 2>&1; then
+              echo "Health check passed"
+              curl -s http://localhost:4000/health
+              exit 0
+            fi
+            echo "Waiting for health... (attempt $i/12)"
+            sleep 5
+          done
+          echo "ERROR: Health check failed after 60s"
+          echo "--- Server log ---"
+          tail -50 /tmp/enclave.log 2>/dev/null || true
+          echo "--- Sidecar log ---"
+          tail -20 /tmp/sidecar.log 2>/dev/null || true
+          exit 1
+          REMOTE
+          rm -f /tmp/deploy_key
