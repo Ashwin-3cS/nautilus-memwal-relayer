@@ -2,25 +2,38 @@
 # Run this on the EC2 HOST to bridge VSOCK traffic to TCP.
 # The enclave exposes the memwal-relayer on VSOCK port 4000.
 # This script makes it available at localhost:4000 on the host.
+#
+# All configuration (including VSOCK port assignments) is read from .env.runtime.
+# Copy .env.example to .env.runtime, fill in real values, then run this script.
 
 set -e
 
-SUI_PROXY_VSOCK_PORT=8101
-WALRUS_PUBLISHER_PROXY_VSOCK_PORT=8102
-WALRUS_AGGREGATOR_PROXY_VSOCK_PORT=8103
-POSTGRES_PROXY_VSOCK_PORT=8104
-REDIS_PROXY_VSOCK_PORT=8105
-OPENAI_PROXY_VSOCK_PORT=8106
-SEAL_BASE_VSOCK_PORT=8107
+ENV_FILE="${1:-.env.runtime}"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: $ENV_FILE not found. Copy .env.example to .env.runtime and fill in values."
+    exit 1
+fi
 
-SUI_RPC_URL="${SUI_RPC_URL:-https://fullnode.mainnet.sui.io:443}"
-WALRUS_PUBLISHER_URL="${WALRUS_PUBLISHER_URL:-https://publisher.walrus-mainnet.walrus.space}"
-WALRUS_AGGREGATOR_URL="${WALRUS_AGGREGATOR_URL:-https://aggregator.walrus-mainnet.walrus.space}"
-DATABASE_URL="${DATABASE_URL:-}"
-REDIS_URL="${REDIS_URL:-}"
-OPENAI_API_BASE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
-# Comma-separated list of SEAL key server HTTPS URLs
-SEAL_KEY_SERVER_URLS="${SEAL_KEY_SERVER_URLS:-}"
+# Source env file (skip comments and blank lines)
+set -a
+# shellcheck disable=SC1090
+while IFS= read -r line; do
+    case "$line" in
+        '#'*|'') continue ;;
+        *) eval "export $line" 2>/dev/null || true ;;
+    esac
+done < "$ENV_FILE"
+set +a
+
+# VSOCK port assignments — all read from env (set in .env.runtime)
+: "${SUI_PROXY_VSOCK_PORT:?SUI_PROXY_VSOCK_PORT not set in $ENV_FILE}"
+: "${WALRUS_PUBLISHER_PROXY_VSOCK_PORT:?WALRUS_PUBLISHER_PROXY_VSOCK_PORT not set in $ENV_FILE}"
+: "${WALRUS_AGGREGATOR_PROXY_VSOCK_PORT:?WALRUS_AGGREGATOR_PROXY_VSOCK_PORT not set in $ENV_FILE}"
+: "${POSTGRES_PROXY_VSOCK_PORT:?POSTGRES_PROXY_VSOCK_PORT not set in $ENV_FILE}"
+: "${REDIS_PROXY_VSOCK_PORT:?REDIS_PROXY_VSOCK_PORT not set in $ENV_FILE}"
+: "${OPENAI_PROXY_VSOCK_PORT:?OPENAI_PROXY_VSOCK_PORT not set in $ENV_FILE}"
+: "${SEAL_BASE_VSOCK_PORT:?SEAL_BASE_VSOCK_PORT not set in $ENV_FILE}"
+# All URLs and secrets come from .env.runtime — no defaults here.
 
 extract_url_host() {
     printf '%s' "$1" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://(\[[^]]+\]|[^/:]+).*#\1#'
