@@ -153,6 +153,26 @@ unset IFS
 # reqwest health poll to fail intermittently.
 socat VSOCK-LISTEN:4000,reuseaddr,fork TCP:localhost:"$PORT" &
 
+# ── Sidecar sanity check ──────────────────────────────────────────────────────
+# Verify the node binary + tsx wrapper can actually start before letting
+# memwal_server spawn it. Stream sanity output to the host VSOCK log.
+echo "── Sidecar sanity check ──"
+ls -la /usr/local/bin/node /scripts/node_modules/.bin/tsx /scripts/sidecar-server.ts 2>&1 || echo "MISSING FILES"
+/usr/local/bin/node --version 2>&1 || echo "node --version FAILED"
+echo "Attempting sidecar dry-run for 3s..."
+( cd /scripts && /usr/local/bin/node ./node_modules/.bin/tsx sidecar-server.ts > /tmp/sidecar.log 2>&1 ) &
+SIDECAR_TEST_PID=$!
+sleep 3
+if kill -0 "$SIDECAR_TEST_PID" 2>/dev/null; then
+    echo "Sidecar dry-run: alive after 3s — killing it so memwal_server can own it"
+    kill "$SIDECAR_TEST_PID" 2>/dev/null || true
+    wait "$SIDECAR_TEST_PID" 2>/dev/null || true
+else
+    echo "Sidecar dry-run: DIED within 3s — see /tmp/sidecar.log"
+    cat /tmp/sidecar.log 2>/dev/null || true
+fi
+( tail -f /tmp/sidecar.log 2>/dev/null | socat - VSOCK-CONNECT:3:5001 2>/dev/null ) &
+
 # ── Start Rust relay server ───────────────────────────────────────────────────
 echo "Starting memwal relay server..."
 /memwal_server > /tmp/server.log 2>&1 &
