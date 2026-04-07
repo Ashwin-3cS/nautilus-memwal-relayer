@@ -174,6 +174,8 @@ fi
 ( tail -f /tmp/sidecar.log 2>/dev/null | socat - VSOCK-CONNECT:3:5001 2>/dev/null ) &
 
 # ── Start Rust relay server ───────────────────────────────────────────────────
+export RUST_BACKTRACE=full
+export RUST_LOG="${RUST_LOG:-info}"
 echo "Starting memwal relay server..."
 /memwal_server > /tmp/server.log 2>&1 &
 SERVER_PID=$!
@@ -185,3 +187,12 @@ echo "memwal relay server started: PID $SERVER_PID"
 trap 'kill $SERVER_PID 2>/dev/null; exit 0' TERM INT
 
 wait $SERVER_PID
+SERVER_EXIT=$?
+echo "── memwal_server exited with code: $SERVER_EXIT ──"
+echo "── /tmp/server.log (direct dump to serial console) ──"
+cat /tmp/server.log 2>/dev/null || echo "(server.log missing)"
+echo "── /tmp/sidecar.log (direct dump to serial console) ──"
+cat /tmp/sidecar.log 2>/dev/null || echo "(sidecar.log missing)"
+echo "── end of logs ──"
+sleep 2
+exit $SERVER_EXIT
