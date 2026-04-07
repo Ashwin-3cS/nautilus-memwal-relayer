@@ -11,7 +11,7 @@ concurrency:
 env:
   APP_DIR: nautilus-app
   ENCLAVE_CPU: 2
-  ENCLAVE_MEM: 6144   # Node + tsx + @mysten/* needs more headroom than pure Rust
+  ENCLAVE_MEM: 4096   # Node + tsx + @mysten/* needs more headroom than pure Rust
 
 jobs:
   deploy:
@@ -129,7 +129,7 @@ jobs:
           sleep 5
           # Update allocator config
           ALLOC=/etc/nitro_enclaves/allocator.yaml
-          sudo sed -i "s/memory_mib:.*/memory_mib: 6144/" "$ALLOC"
+          sudo sed -i "s/memory_mib:.*/memory_mib: 4096/" "$ALLOC"
           sudo sed -i "s/cpu_count:.*/cpu_count: 2/"    "$ALLOC"
           sudo systemctl enable nitro-enclaves-allocator.service || true
           # Clear any prior failed state so systemd rate limiting doesn't block us,
@@ -153,7 +153,7 @@ jobs:
           set -e
           sudo nitro-cli run-enclave \
             --cpu-count 2 \
-            --memory 6144 \
+            --memory 4096 \
             --eif-path ~/nautilus-app/out/nitro.eif
           sudo nitro-cli describe-enclaves | jq -r '.[0] | "CID: \(.EnclaveCID)  State: \(.State)"'
           REMOTE
