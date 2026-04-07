@@ -41,6 +41,12 @@ async fn main() {
         config.rate_limit.max_requests_per_delegate_key,
         config.rate_limit.max_storage_bytes / 1_048_576
     );
+    let emb_base = config.embedding_api_base.as_deref().unwrap_or(&config.openai_api_base);
+    tracing::info!("  embedding model: {} @ {}", config.embedding_model, emb_base);
+    if let Some(dim) = config.embedding_dimensions {
+        tracing::info!("  embedding dimensions: {}", dim);
+    }
+    tracing::info!("  llm model: {}", config.llm_model);
 
     // Start TS sidecar HTTP server (SEAL + Walrus operations)
     let sidecar_url = config.sidecar_url.clone();
@@ -98,6 +104,28 @@ async fn main() {
     let db = VectorDb::new(&config.database_url)
         .await
         .expect("Failed to connect to PostgreSQL");
+
+    // Warn if the DB vector column dimension doesn't match EMBEDDING_DIMENSIONS
+    if let Some(expected_dim) = config.embedding_dimensions {
+        let dim_check: Result<Option<i32>, _> = sqlx::query_scalar(
+            "SELECT atttypmod - 4 FROM pg_attribute a \
+             JOIN pg_class c ON a.attrelid = c.oid \
+             WHERE c.relname = 'vector_entries' AND a.attname = 'embedding'"
+        )
+        .fetch_optional(db.pool())
+        .await;
+
+        if let Ok(Some(actual_dim)) = dim_check {
+            if actual_dim as u32 != expected_dim {
+                tracing::warn!(
+                    "⚠️  Vector dimension mismatch: DB column is {} but EMBEDDING_DIMENSIONS={}. \
+                     Embeddings will fail. Fix with: \
+                     TRUNCATE vector_entries; ALTER TABLE vector_entries ALTER COLUMN embedding TYPE vector({});",
+                    actual_dim, expected_dim, expected_dim
+                );
+            }
+        }
+    }
 
     // Initialize Walrus client (SDK wraps Publisher + Aggregator HTTP APIs)
     let walrus_client = walrus_rs::WalrusClient::new(

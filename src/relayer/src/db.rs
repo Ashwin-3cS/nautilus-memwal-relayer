@@ -9,6 +9,10 @@ pub struct VectorDb {
 }
 
 impl VectorDb {
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Initialize database connection pool and run migrations
     pub async fn new(database_url: &str) -> Result<Self, AppError> {
         let pool = PgPoolOptions::new()
