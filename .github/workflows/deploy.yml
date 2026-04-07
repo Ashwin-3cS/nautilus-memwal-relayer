@@ -159,35 +159,6 @@ jobs:
           REMOTE
           rm -f /tmp/deploy_key
 
-      # ── Send config into the enclave ──────────────────────────────────────
-      # Strips comment lines and blank lines from ~/.env.runtime, then pipes
-      # the KEY=VALUE pairs to the enclave via VSOCK port 7000.
-      - name: Send config to enclave
-        env:
-          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
-          EC2_USER: ${{ secrets.TEE_EC2_USER }}
-          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
-        run: |
-          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
-          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
-          $SSH 'bash -s' << 'REMOTE'
-          set -e
-          CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
-          if [ -z "$CID" ]; then echo "ERROR: Enclave not running"; exit 1; fi
-
-          for i in $(seq 1 10); do
-            if grep -v '^[[:space:]]*#' ~/.env.runtime \
-               | grep -v '^[[:space:]]*$' \
-               | socat - VSOCK-CONNECT:$CID:7000 2>/dev/null; then
-              echo "Config sent to enclave CID=$CID"
-              break
-            fi
-            echo "Waiting for enclave to accept config... (attempt $i/10)"
-            sleep 3
-          done
-          REMOTE
-          rm -f /tmp/deploy_key
-
       # ── Setup host-side VSOCK bridge + outbound systemd services ─────────
       # Sources ~/.env.runtime (written in "Write env file" step) to read
       # all URL values needed to create the socat systemd units.
@@ -350,6 +321,37 @@ jobs:
           sudo systemctl is-active nautilus-bridge.service
           sudo systemctl is-active nautilus-outbound-sui.service
           echo "Bridge active: CID=$CID  TCP:4000 -> VSOCK:4000"
+          REMOTE
+          rm -f /tmp/deploy_key
+
+      # ── Send config into the enclave ──────────────────────────────────────
+      # Log collectors are already running (set up in previous step) so any
+      # crash in run.sh will be captured in /tmp/enclave.log on the host.
+      # Strips comment lines and blank lines from ~/.env.runtime, then pipes
+      # the KEY=VALUE pairs to the enclave via VSOCK port 7000.
+      - name: Send config to enclave
+        env:
+          EC2_HOST: ${{ secrets.TEE_EC2_HOST }}
+          EC2_USER: ${{ secrets.TEE_EC2_USER }}
+          EC2_KEY: ${{ secrets.TEE_EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_KEY" > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /tmp/deploy_key $EC2_USER@$EC2_HOST"
+          $SSH 'bash -s' << 'REMOTE'
+          set -e
+          CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
+          if [ -z "$CID" ]; then echo "ERROR: Enclave not running"; exit 1; fi
+
+          for i in $(seq 1 10); do
+            if grep -v '^[[:space:]]*#' ~/.env.runtime \
+               | grep -v '^[[:space:]]*$' \
+               | socat - VSOCK-CONNECT:$CID:7000 2>/dev/null; then
+              echo "Config sent to enclave CID=$CID"
+              break
+            fi
+            echo "Waiting for enclave to accept config... (attempt $i/10)"
+            sleep 3
+          done
           REMOTE
           rm -f /tmp/deploy_key
 
