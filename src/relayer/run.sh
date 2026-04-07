@@ -98,7 +98,9 @@ setup_outbound_proxy "sui"               "$SUI_RPC_URL"           "127.0.0.2" "$
 setup_outbound_proxy "walrus-publisher"  "$WALRUS_PUBLISHER_URL"  "127.0.0.3" "$WALRUS_PUBLISHER_PROXY_VSOCK_PORT"
 setup_outbound_proxy "walrus-aggregator" "$WALRUS_AGGREGATOR_URL" "127.0.0.4" "$WALRUS_AGGREGATOR_PROXY_VSOCK_PORT"
 
-# Postgres: rewrite DATABASE_URL to point at loopback alias
+# Postgres proxy: /etc/hosts maps the hostname to the loopback alias.
+# We do NOT rewrite DATABASE_URL — the original hostname stays in the URL so
+# that TLS cert validation (sslmode=require) succeeds against the real cert.
 PG_HOST=$(printf '%s' "$DATABASE_URL" | sed -nE 's#^[^:]+://[^@]+@([^:/]+).*#\1#p')
 PG_PORT=$(printf '%s' "$DATABASE_URL" | sed -nE 's#^[^:]+://[^@]+@[^:]+:([0-9]+).*#\1#p')
 PG_PORT="${PG_PORT:-5432}"
@@ -108,12 +110,12 @@ if [ -n "$PG_HOST" ]; then
     echo "${LOOPBACK_IP} ${PG_HOST}" >> /etc/hosts
     echo "Outbound proxy: ${PG_HOST}:${PG_PORT} -> ${LOOPBACK_IP}:${PG_PORT} -> VSOCK:${POSTGRES_PROXY_VSOCK_PORT}"
     socat TCP-LISTEN:${PG_PORT},bind=${LOOPBACK_IP},reuseaddr,fork VSOCK-CONNECT:3:${POSTGRES_PROXY_VSOCK_PORT} &
-    export DATABASE_URL=$(printf '%s' "$DATABASE_URL" | sed "s|${PG_HOST}|${LOOPBACK_IP}|")
 fi
 
-# Redis: rewrite REDIS_URL to point at loopback alias
-REDIS_HOST=$(extract_url_host "$REDIS_URL")
-REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[^:]+://[^:]+:([0-9]+).*#\1#p')
+# Redis proxy: extract host from rediss://user:pass@host:port format.
+# Same /etc/hosts approach — URL is unchanged so TLS cert validates correctly.
+REDIS_HOST=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[a-z]+://([^:@]+:)?[^@]+@([^:/@]+).*#\2#p')
+REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#.*@[^:/@]+:([0-9]+).*#\1#p')
 REDIS_PORT="${REDIS_PORT:-6379}"
 if [ -n "$REDIS_HOST" ]; then
     LOOPBACK_IP="127.0.0.6"
@@ -121,7 +123,6 @@ if [ -n "$REDIS_HOST" ]; then
     echo "${LOOPBACK_IP} ${REDIS_HOST}" >> /etc/hosts
     echo "Outbound proxy: ${REDIS_HOST}:${REDIS_PORT} -> ${LOOPBACK_IP}:${REDIS_PORT} -> VSOCK:${REDIS_PROXY_VSOCK_PORT}"
     socat TCP-LISTEN:${REDIS_PORT},bind=${LOOPBACK_IP},reuseaddr,fork VSOCK-CONNECT:3:${REDIS_PROXY_VSOCK_PORT} &
-    export REDIS_URL=$(printf '%s' "$REDIS_URL" | sed "s|${REDIS_HOST}|${LOOPBACK_IP}|")
 fi
 
 setup_outbound_proxy "openai" "$OPENAI_API_BASE" "127.0.0.7" "$OPENAI_PROXY_VSOCK_PORT"
