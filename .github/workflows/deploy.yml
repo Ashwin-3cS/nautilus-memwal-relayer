@@ -157,14 +157,14 @@ jobs:
             --eif-path ~/nautilus-app/out/nitro.eif \
             --debug-mode
 
-          # In debug mode, capture serial console output to a host file so we
-          # can see early-boot / init / run.sh failures that occur before the
-          # VSOCK log pipe is set up.
+          # In debug mode, capture serial console output via systemd-run so
+          # the process survives SSH session end. Streams to a host file we
+          # can tail on health-check failure.
           ENCLAVE_ID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveID')
+          sudo systemctl stop nautilus-console.service 2>/dev/null || true
           sudo truncate -s 0 /tmp/enclave-console.log 2>/dev/null || true
-          nohup sudo nitro-cli console --enclave-id "$ENCLAVE_ID" \
-            > /tmp/enclave-console.log 2>&1 &
-          disown || true
+          sudo systemd-run --unit=nautilus-console --collect \
+            bash -c "nitro-cli console --enclave-id $ENCLAVE_ID > /tmp/enclave-console.log 2>&1" || true
           sudo nitro-cli describe-enclaves | jq -r '.[0] | "CID: \(.EnclaveCID)  State: \(.State)"'
           REMOTE
           rm -f /tmp/deploy_key
