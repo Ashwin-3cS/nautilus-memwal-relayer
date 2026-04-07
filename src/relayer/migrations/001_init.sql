@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS vector_entries (
     id TEXT PRIMARY KEY,
     owner TEXT NOT NULL,
     blob_id TEXT NOT NULL,
-    embedding vector (1536) NOT NULL,
+    -- Dimension must match EMBEDDING_DIMENSIONS env var.
+    -- Default: 1024 (jina-embeddings-v3). Change to 1536 for OpenAI text-embedding-3-small.
+    embedding vector(1024) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
