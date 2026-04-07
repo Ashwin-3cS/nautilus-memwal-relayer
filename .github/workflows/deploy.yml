@@ -226,62 +226,57 @@ jobs:
             case "$scheme" in https|rediss) printf '443';; http|redis) printf '80';; *) printf '443';; esac
           }
 
+          # Write a systemd unit file using printf to avoid heredoc column-0 issues
+          write_unit() {
+            dest="$1"; shift
+            printf '%s\n' "$@" | sudo tee "$dest" > /dev/null
+          }
+
           create_outbound_service() {
             svc="$1"; vsock_port="$2"; url="$3"
             h=$(extract_url_host "$url"); p=$(extract_url_port "$url")
-            sudo tee "/etc/systemd/system/${svc}.service" > /dev/null << EOF
-[Unit]
-Description=${svc} (VSOCK:${vsock_port} -> ${h}:${p})
-After=network.target
-[Service]
-ExecStart=/usr/bin/socat VSOCK-LISTEN:${vsock_port},fork,reuseaddr TCP:${h}:${p}
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
+            printf '[Unit]\nDescription=%s (VSOCK:%s -> %s:%s)\nAfter=network.target\n[Service]\nExecStart=/usr/bin/socat VSOCK-LISTEN:%s,fork,reuseaddr TCP:%s:%s\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' \
+              "$svc" "$vsock_port" "$h" "$p" "$vsock_port" "$h" "$p" \
+              | sudo tee "/etc/systemd/system/${svc}.service" > /dev/null
           }
 
           CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID // empty')
           [ -z "$CID" ] && { echo "ERROR: no enclave CID"; exit 1; }
 
           # Inbound bridge: host TCP:4000 → enclave VSOCK:4000
-          sudo tee /etc/systemd/system/nautilus-bridge.service > /dev/null << EOF
-[Unit]
-Description=Nautilus VSOCK bridge (TCP:4000 <-> VSOCK:4000)
-After=network.target
-[Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:4000,reuseaddr,fork VSOCK-CONNECT:${CID}:4000
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
+          write_unit /etc/systemd/system/nautilus-bridge.service \
+            '[Unit]' \
+            'Description=Nautilus VSOCK bridge (TCP:4000 <-> VSOCK:4000)' \
+            'After=network.target' \
+            '[Service]' \
+            "ExecStart=/usr/bin/socat TCP-LISTEN:4000,reuseaddr,fork VSOCK-CONNECT:${CID}:4000" \
+            'Restart=always' \
+            'RestartSec=2' \
+            '[Install]' \
+            'WantedBy=multi-user.target'
 
           # Log collectors (server + sidecar)
-          sudo tee /etc/systemd/system/nautilus-logs.service > /dev/null << EOF
-[Unit]
-Description=Nautilus server log collector (VSOCK:5000)
-After=network.target
-[Service]
-ExecStart=/usr/bin/socat VSOCK-LISTEN:5000,fork,reuseaddr OPEN:/tmp/enclave.log,creat,append
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
+          write_unit /etc/systemd/system/nautilus-logs.service \
+            '[Unit]' \
+            'Description=Nautilus server log collector (VSOCK:5000)' \
+            'After=network.target' \
+            '[Service]' \
+            'ExecStart=/usr/bin/socat VSOCK-LISTEN:5000,fork,reuseaddr OPEN:/tmp/enclave.log,creat,append' \
+            'Restart=always' \
+            'RestartSec=2' \
+            '[Install]' \
+            'WantedBy=multi-user.target'
 
-          sudo tee /etc/systemd/system/nautilus-sidecar-logs.service > /dev/null << EOF
-[Unit]
-Description=Nautilus sidecar log collector (VSOCK:5001)
-After=network.target
-[Service]
-ExecStart=/usr/bin/socat VSOCK-LISTEN:5001,fork,reuseaddr OPEN:/tmp/sidecar.log,creat,append
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
+          write_unit /etc/systemd/system/nautilus-sidecar-logs.service \
+            '[Unit]' \
+            'Description=Nautilus sidecar log collector (VSOCK:5001)' \
+            'After=network.target' \
+            '[Service]' \
+            'ExecStart=/usr/bin/socat VSOCK-LISTEN:5001,fork,reuseaddr OPEN:/tmp/sidecar.log,creat,append' \
+            'Restart=always' \
+            'RestartSec=2' \
+            '[Install]' \
+            'WantedBy=multi-user.target'
 
           # Outbound proxies — VSOCK port numbers come from ~/.env.runtime
           create_outbound_service "nautilus-outbound-sui"               "${SUI_PROXY_VSOCK_PORT:-8101}"               "$SUI_RPC_URL"
@@ -293,34 +288,18 @@ EOF
           PG_PORT=$(printf '%s' "$DATABASE_URL" | sed -nE 's#^[^:]+://[^@]+@[^:]+:([0-9]+).*#\1#p')
           PG_PORT="${PG_PORT:-5432}"
           POSTGRES_VSOCK="${POSTGRES_PROXY_VSOCK_PORT:-8104}"
-          sudo tee "/etc/systemd/system/nautilus-outbound-postgres.service" > /dev/null << EOF
-[Unit]
-Description=Nautilus outbound Postgres (VSOCK:${POSTGRES_VSOCK} -> ${PG_HOST}:${PG_PORT})
-After=network.target
-[Service]
-ExecStart=/usr/bin/socat VSOCK-LISTEN:${POSTGRES_VSOCK},fork,reuseaddr TCP:${PG_HOST}:${PG_PORT}
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
+          printf '[Unit]\nDescription=Nautilus outbound Postgres (VSOCK:%s -> %s:%s)\nAfter=network.target\n[Service]\nExecStart=/usr/bin/socat VSOCK-LISTEN:%s,fork,reuseaddr TCP:%s:%s\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' \
+            "$POSTGRES_VSOCK" "$PG_HOST" "$PG_PORT" "$POSTGRES_VSOCK" "$PG_HOST" "$PG_PORT" \
+            | sudo tee /etc/systemd/system/nautilus-outbound-postgres.service > /dev/null
 
           # Redis — parse host:port from REDIS_URL (handles rediss:// with credentials)
           REDIS_HOST=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[a-z]+://([^:]+:)?[^@]+@([^:/@]+).*#\2#p')
           REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#.*@[^:]+:([0-9]+).*#\1#p')
           REDIS_PORT="${REDIS_PORT:-6379}"
           REDIS_VSOCK="${REDIS_PROXY_VSOCK_PORT:-8105}"
-          sudo tee "/etc/systemd/system/nautilus-outbound-redis.service" > /dev/null << EOF
-[Unit]
-Description=Nautilus outbound Redis (VSOCK:${REDIS_VSOCK} -> ${REDIS_HOST}:${REDIS_PORT})
-After=network.target
-[Service]
-ExecStart=/usr/bin/socat VSOCK-LISTEN:${REDIS_VSOCK},fork,reuseaddr TCP:${REDIS_HOST}:${REDIS_PORT}
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
+          printf '[Unit]\nDescription=Nautilus outbound Redis (VSOCK:%s -> %s:%s)\nAfter=network.target\n[Service]\nExecStart=/usr/bin/socat VSOCK-LISTEN:%s,fork,reuseaddr TCP:%s:%s\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' \
+            "$REDIS_VSOCK" "$REDIS_HOST" "$REDIS_PORT" "$REDIS_VSOCK" "$REDIS_HOST" "$REDIS_PORT" \
+            | sudo tee /etc/systemd/system/nautilus-outbound-redis.service > /dev/null
 
           create_outbound_service "nautilus-outbound-openai" "${OPENAI_PROXY_VSOCK_PORT:-8106}" "$OPENAI_API_BASE"
 
@@ -341,17 +320,9 @@ EOF
               VSOCK_PORT=$((SEAL_BASE + SEAL_IDX))
               SEAL_HOST=$(extract_url_host "$SEAL_URL")
               SEAL_PORT=$(extract_url_port "$SEAL_URL")
-              sudo tee "/etc/systemd/system/nautilus-outbound-seal-${SEAL_IDX}.service" > /dev/null << EOF
-[Unit]
-Description=Nautilus outbound SEAL ${SEAL_IDX} (VSOCK:${VSOCK_PORT} -> ${SEAL_HOST}:${SEAL_PORT})
-After=network.target
-[Service]
-ExecStart=/usr/bin/socat VSOCK-LISTEN:${VSOCK_PORT},fork,reuseaddr TCP:${SEAL_HOST}:${SEAL_PORT}
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
+              printf '[Unit]\nDescription=Nautilus outbound SEAL %s (VSOCK:%s -> %s:%s)\nAfter=network.target\n[Service]\nExecStart=/usr/bin/socat VSOCK-LISTEN:%s,fork,reuseaddr TCP:%s:%s\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' \
+                "$SEAL_IDX" "$VSOCK_PORT" "$SEAL_HOST" "$SEAL_PORT" "$VSOCK_PORT" "$SEAL_HOST" "$SEAL_PORT" \
+                | sudo tee "/etc/systemd/system/nautilus-outbound-seal-${SEAL_IDX}.service" > /dev/null
               SEAL_IDX=$((SEAL_IDX + 1))
             done
             unset IFS
