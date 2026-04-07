@@ -91,6 +91,7 @@ done
 
 export SIDECAR_URL="${SIDECAR_URL:-http://127.0.0.1:9000}"
 export SIDECAR_SCRIPTS_DIR="${SIDECAR_SCRIPTS_DIR:-/scripts}"
+export SIDECAR_PORT="${SIDECAR_PORT:-9000}"
 
 # ── Outbound proxies ──────────────────────────────────────────────────────────
 # All VSOCK ports come from env (defined in .env.runtime, sent via config handshake).
@@ -143,33 +144,11 @@ for SEAL_URL in $SEAL_KEY_SERVER_URLS; do
 done
 unset IFS
 
-# ── TS sidecar ────────────────────────────────────────────────────────────────
-echo "Starting TS sidecar..."
-export SIDECAR_PORT=9000
-
-cd /scripts && /usr/local/bin/node ./node_modules/.bin/tsx sidecar-server.ts > /tmp/sidecar.log 2>&1 &
-SIDECAR_PID=$!
-cd /
-
-SIDECAR_READY=0
-for i in $(seq 1 30); do
-    if wget -q -O- http://127.0.0.1:9000/health >/dev/null 2>&1; then
-        SIDECAR_READY=1
-        break
-    fi
-    sleep 0.5
-done
-
-if [ "$SIDECAR_READY" -eq 0 ]; then
-    echo "ERROR: TS sidecar failed to start within 15s" >&2
-    cat /tmp/sidecar.log >&2
-    exit 1
-fi
-echo "TS sidecar ready (PID $SIDECAR_PID)"
-
-(tail -f /tmp/sidecar.log 2>/dev/null | socat - VSOCK-CONNECT:3:5001 2>/dev/null) &
-
 # ── Expose relay server via VSOCK ─────────────────────────────────────────────
+# NOTE: The TS sidecar is spawned and managed by memwal_server itself
+# (ENCLAVE_MODE=true makes it use /usr/local/bin/node directly). Do NOT
+# start a second sidecar here — a port-9000 conflict causes the server's
+# reqwest health poll to fail intermittently.
 socat VSOCK-LISTEN:4000,reuseaddr,fork TCP:localhost:"$PORT" &
 
 # ── Start Rust relay server ───────────────────────────────────────────────────
@@ -181,6 +160,6 @@ echo "memwal relay server started: PID $SERVER_PID"
 (tail -f /tmp/server.log 2>/dev/null | socat - VSOCK-CONNECT:3:5000 2>/dev/null) &
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
-trap 'kill $SIDECAR_PID $SERVER_PID 2>/dev/null; exit 0' TERM INT
+trap 'kill $SERVER_PID 2>/dev/null; exit 0' TERM INT
 
 wait $SERVER_PID
