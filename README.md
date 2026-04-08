@@ -16,6 +16,12 @@ MemWal's managed relayer is shared infrastructure — the operator can see plain
 | Ephemeral enclave signing key — all API responses signed, verifiable by client | done |
 | Reproducible stagex build — PCR0 stable across rebuilds | done |
 
+# Product End
+<img width="1213" height="1044" alt="image" src="https://github.com/user-attachments/assets/d6628ac9-c6aa-431a-a0b3-c6012b34688b" />
+
+# Client End
+<img width="648" height="1022" alt="image" src="https://github.com/user-attachments/assets/e80a9bcc-4165-4e08-9630-fa9248d92acd" />
+
 ---
 
 ## Attestation endpoints
