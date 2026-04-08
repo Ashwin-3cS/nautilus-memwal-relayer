@@ -540,9 +540,13 @@ app.post("/walrus/upload", async (req, res) => {
             });
 
             // Patch: convert GasCoin intents → sender's SUI coins.
-            // Enoki rejects GasCoin as tx argument, but relay requires the tip.
-            // After patching, signer pays tip from own SUI; Enoki sponsors gas.
-            patchGasCoinIntents(registerTx);
+            // Only needed for Enoki sponsorship (Enoki rejects GasCoin as tx
+            // argument). In direct-sign mode the unpatched tx uses GasCoin
+            // normally; patching here would break gas selection and cause
+            // "No valid gas coins found for the transaction".
+            if (enokiApiKey) {
+                patchGasCoinIntents(registerTx);
+            }
             const tipRecipient = await getUploadRelayTipAddress();
             const registerAllowedAddresses = dedupeAddresses([signerAddress, tipRecipient]);
             const registerDigest = await executeWithEnokiSponsor(registerTx, signer, registerAllowedAddresses);
