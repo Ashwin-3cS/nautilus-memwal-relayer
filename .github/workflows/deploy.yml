@@ -285,6 +285,14 @@ jobs:
             EMBEDDING_SVC=""
           fi
 
+          # Walrus upload relay proxy — required by @mysten/walrus writeBlobFlow in the sidecar
+          if [ -n "$WALRUS_UPLOAD_RELAY_URL" ]; then
+            create_outbound_service "nautilus-outbound-walrus-upload-relay" "${WALRUS_UPLOAD_RELAY_PROXY_VSOCK_PORT:-8109}" "$WALRUS_UPLOAD_RELAY_URL"
+            WALRUS_UPLOAD_RELAY_SVC="nautilus-outbound-walrus-upload-relay.service"
+          else
+            WALRUS_UPLOAD_RELAY_SVC=""
+          fi
+
           # SEAL key servers (comma-separated URLs → sequential VSOCK ports from SEAL_BASE_VSOCK_PORT)
           SEAL_BASE="${SEAL_BASE_VSOCK_PORT:-8107}"
           SEAL_IDX=0
@@ -319,6 +327,7 @@ jobs:
             nautilus-outbound-openai.service
 
           [ -n "$EMBEDDING_SVC" ] && sudo systemctl enable --now "$EMBEDDING_SVC"
+          [ -n "$WALRUS_UPLOAD_RELAY_SVC" ] && sudo systemctl enable --now "$WALRUS_UPLOAD_RELAY_SVC"
 
           # Enable SEAL services dynamically
           if [ -n "$SEAL_KEY_SERVER_URLS" ]; then

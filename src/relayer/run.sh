@@ -135,6 +135,11 @@ if [ -n "$EMBEDDING_API_BASE" ] && [ "$EMBEDDING_API_BASE" != "$OPENAI_API_BASE"
     setup_outbound_proxy "embedding" "$EMBEDDING_API_BASE" "127.0.0.9" "$EMBEDDING_PROXY_VSOCK_PORT"
 fi
 
+# Walrus upload relay proxy — required by @mysten/walrus writeBlobFlow in the sidecar
+if [ -n "$WALRUS_UPLOAD_RELAY_URL" ]; then
+    setup_outbound_proxy "walrus-upload-relay" "$WALRUS_UPLOAD_RELAY_URL" "127.0.0.10" "$WALRUS_UPLOAD_RELAY_PROXY_VSOCK_PORT"
+fi
+
 # SEAL key servers: loop over comma-separated SEAL_KEY_SERVER_URLS
 SEAL_IDX=0
 IFS=','
