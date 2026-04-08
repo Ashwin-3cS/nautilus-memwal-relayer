@@ -347,7 +347,16 @@ pub struct HealthResponse {
 #[derive(Debug, Serialize)]
 pub struct SignedResponse<T: Serialize> {
     pub data: T,
-    /// Hex-encoded Ed25519 signature over the canonical JSON bytes of `data`.
+    /// Intent scope byte — distinguishes endpoints (remember=1, recall=2, …).
+    /// Part of the BCS-encoded IntentMessage that the signature covers.
+    pub intent_scope: u8,
+    /// Unix timestamp (ms) — replay-protection field, also part of the
+    /// BCS-encoded IntentMessage covered by the signature.
+    pub timestamp_ms: u64,
+    /// Hex-encoded Ed25519 signature over `bcs(IntentMessage { intent_scope,
+    /// timestamp_ms, payload: sha256(canonical_json(data)) })`. This matches
+    /// the Move `verify_signature<T, P=vector<u8>>` layout so the same
+    /// signature is verifiable on-chain.
     pub signature: String,
     /// Hex-encoded enclave ephemeral Ed25519 public key.
     pub enclave_public_key: String,

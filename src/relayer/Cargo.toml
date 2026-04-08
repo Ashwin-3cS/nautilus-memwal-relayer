@@ -31,6 +31,7 @@ hex = "0.4"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bcs = "0.1.6"
 
 # Config
 dotenvy = "0.15"

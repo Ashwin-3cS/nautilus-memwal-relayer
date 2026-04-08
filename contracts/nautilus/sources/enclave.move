@@ -6,7 +6,6 @@ module nautilus::enclave;
 use std::bcs;
 use std::string::String;
 use sui::ed25519;
-use sui::hash;
 use sui::nitro_attestation::NitroAttestationDocument;
 
 use fun to_pcrs as NitroAttestationDocument.to_pcrs;
@@ -61,13 +60,6 @@ public struct IntentMessage<T: drop> has copy, drop {
     intent: u8,
     timestamp_ms: u64,
     payload: T,
-}
-
-/// Payload type for the sign_name endpoint — matches the tee-app's Rust SignedName struct
-/// BCS field order: name (String), message (String)
-public struct SignedName has copy, drop {
-    name: String,
-    message: String,
 }
 
 /// One-time witness for Nautilus enclave module initialization
@@ -185,30 +177,25 @@ public fun update_name<T: drop>(config: &mut EnclaveConfig<T>, cap: &Cap<T>, nam
     config.name = name;
 }
 
-/// Entry function to verify a SignedName signature from a CLI or PTB call.
-/// Aborts with EInvalidSignature if the signature does not match.
-entry fun verify_signed_name(
-    enclave: &Enclave<ENCLAVE>,
+/// Verify an enclave-signed response from the MemWal relay.
+///
+/// The relay signs `bcs(IntentMessage { intent, timestamp_ms, payload })`
+/// where `payload` is `sha256(canonical_json(response.data))`. Clients pass
+/// the same `intent_scope`, `timestamp_ms`, and `body_hash` they used to
+/// verify off-chain, and this function reconstructs the IntentMessage and
+/// runs `ed25519_verify` against the registered enclave public key.
+///
+/// Aborts with `EInvalidSignature` if verification fails. Generic over the
+/// witness type `T` so any application that registers an `Enclave<T>` can
+/// reuse the same verifier.
+entry fun verify_signed_payload<T>(
+    enclave: &Enclave<T>,
     intent_scope: u8,
     timestamp_ms: u64,
-    name: String,
-    message: String,
+    body_hash: vector<u8>,
     signature: vector<u8>,
 ) {
-    let payload = SignedName { name, message };
-    let valid = verify_signature(enclave, intent_scope, timestamp_ms, payload, &signature);
-    assert!(valid, EInvalidSignature);
-}
-
-/// Verify a signature over raw bytes (blake2b256 hash, no IntentMessage wrapping).
-/// Used by TS template and any endpoint that signs blake2b256(data).
-entry fun verify_signed_data<T>(
-    enclave: &Enclave<T>,
-    data: vector<u8>,
-    signature: vector<u8>,
-) {
-    let hashed = hash::blake2b256(&data);
-    let valid = ed25519::ed25519_verify(&signature, &enclave.pk, &hashed);
+    let valid = verify_signature(enclave, intent_scope, timestamp_ms, body_hash, &signature);
     assert!(valid, EInvalidSignature);
 }
 

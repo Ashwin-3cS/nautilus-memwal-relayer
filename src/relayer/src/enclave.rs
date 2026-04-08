@@ -17,9 +17,42 @@ use axum::Json;
 use nautilus_enclave::EnclaveKeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::types::{AppState, SignedResponse};
+
+// ── Intent scope constants ────────────────────────────────────────────────
+//
+// Each protected endpoint signs with a distinct intent byte so a signature
+// minted for /api/remember can never be replayed against /api/recall etc.
+// These MUST stay in sync with the client-side verifier and any on-chain
+// PTBs that call `verify_signature` on the Move side.
+pub const INTENT_REMEMBER:        u8 = 1;
+pub const INTENT_RECALL:          u8 = 2;
+pub const INTENT_REMEMBER_MANUAL: u8 = 3;
+pub const INTENT_RECALL_MANUAL:   u8 = 4;
+pub const INTENT_ANALYZE:         u8 = 5;
+pub const INTENT_ASK:             u8 = 6;
+pub const INTENT_RESTORE:         u8 = 7;
+
+// ── IntentMessage (BCS layout matches Move `IntentMessage<vector<u8>>`) ───
+//
+// Move side (contracts/nautilus/sources/enclave.move):
+//   public struct IntentMessage<T: drop> has copy, drop {
+//       intent: u8,
+//       timestamp_ms: u64,
+//       payload: T,
+//   }
+//
+// We instantiate P = vector<u8> on-chain, which BCS-encodes as
+// ULEB128 length prefix + raw bytes — identical to `Vec<u8>` here.
+#[derive(Serialize)]
+struct IntentMessage {
+    intent: u8,
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+}
 
 // ── In-memory ring buffer for the /logs endpoint ──────────────────────────
 
@@ -54,12 +87,39 @@ impl LogBuffer {
 // ── Signed response helper ────────────────────────────────────────────────
 
 /// Sign `data` with the enclave ephemeral keypair and return the wrapper.
-/// The signature covers the canonical JSON serialization of `data`.
-pub fn sign_response<T: Serialize>(kp: &EnclaveKeyPair, data: T) -> SignedResponse<T> {
+///
+/// The signature covers the BCS encoding of
+/// `IntentMessage { intent, timestamp_ms, payload: sha256(json(data)) }` —
+/// the same byte layout the Move `verify_signature<T, vector<u8>>` function
+/// reconstructs on-chain. Off-chain clients can verify by recomputing the
+/// same BCS bytes from the wrapper fields.
+pub fn sign_response<T: Serialize>(
+    kp: &EnclaveKeyPair,
+    intent: u8,
+    data: T,
+) -> SignedResponse<T> {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Hash the canonical JSON of `data` so the on-chain payload stays
+    // bounded (32 bytes) regardless of response size.
     let json_bytes = serde_json::to_vec(&data).expect("serialization is infallible");
-    let sig = kp.sign(&json_bytes);
+    let body_hash = Sha256::digest(&json_bytes).to_vec();
+
+    let intent_message = IntentMessage {
+        intent,
+        timestamp_ms,
+        payload: body_hash,
+    };
+    let signed_bytes = bcs::to_bytes(&intent_message).expect("bcs serialization is infallible");
+    let sig = kp.sign(&signed_bytes);
+
     SignedResponse {
         data,
+        intent_scope: intent,
+        timestamp_ms,
         signature: hex::encode(sig.to_bytes()),
         enclave_public_key: hex::encode(kp.public_key_bytes()),
     }

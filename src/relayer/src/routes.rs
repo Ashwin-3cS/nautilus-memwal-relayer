@@ -4,7 +4,10 @@ use axum::response::Response;
 use base64::Engine as _;
 use std::sync::Arc;
 
-use crate::enclave::sign_response;
+use crate::enclave::{
+    sign_response, INTENT_ANALYZE, INTENT_ASK, INTENT_RECALL, INTENT_RECALL_MANUAL,
+    INTENT_REMEMBER, INTENT_REMEMBER_MANUAL, INTENT_RESTORE,
+};
 use crate::seal;
 use crate::walrus;
 use crate::rate_limit;
@@ -161,7 +164,7 @@ pub async fn remember(
         blob_id, owner, namespace, vector.len()
     );
 
-    Ok(Json(sign_response(&state.eph_kp, RememberResponse {
+    Ok(Json(sign_response(&state.eph_kp, INTENT_REMEMBER, RememberResponse {
         id,
         blob_id,
         owner: owner.clone(),
@@ -266,7 +269,7 @@ pub async fn recall(
     let total = results.len();
     tracing::info!("recall complete: {} results for owner={}", total, owner);
 
-    Ok(Json(sign_response(&state.eph_kp, RecallResponse { results, total })))
+    Ok(Json(sign_response(&state.eph_kp, INTENT_RECALL, RecallResponse { results, total })))
 }
 
 
@@ -332,7 +335,7 @@ pub async fn remember_manual(
 
     tracing::info!("remember_manual complete: id={}, blob_id={}, ns={}", id, blob_id, namespace);
 
-    Ok(Json(sign_response(&state.eph_kp, RememberManualResponse {
+    Ok(Json(sign_response(&state.eph_kp, INTENT_REMEMBER_MANUAL, RememberManualResponse {
         id,
         blob_id,
         owner: owner.clone(),
@@ -368,7 +371,7 @@ pub async fn recall_manual(
 
     tracing::info!("recall_manual complete: {} results for owner={} ns={}", total, owner, namespace);
 
-    Ok(Json(sign_response(&state.eph_kp, RecallManualResponse {
+    Ok(Json(sign_response(&state.eph_kp, INTENT_RECALL_MANUAL, RecallManualResponse {
         results: hits,
         total,
     })))
@@ -398,7 +401,7 @@ pub async fn analyze(
     tracing::info!("  → Extracted {} facts", facts.len());
 
     if facts.is_empty() {
-        return Ok(Json(sign_response(&state.eph_kp, AnalyzeResponse {
+        return Ok(Json(sign_response(&state.eph_kp, INTENT_ANALYZE, AnalyzeResponse {
             facts: vec![],
             total: 0,
             owner: owner.clone(),
@@ -464,7 +467,7 @@ pub async fn analyze(
     let total = stored_facts.len();
     tracing::info!("analyze complete: {} facts stored for owner={}", total, owner);
 
-    Ok(Json(sign_response(&state.eph_kp, AnalyzeResponse {
+    Ok(Json(sign_response(&state.eph_kp, INTENT_ANALYZE, AnalyzeResponse {
         facts: stored_facts,
         total,
         owner: owner.clone(),
@@ -737,7 +740,7 @@ pub async fn ask(
 
     tracing::info!("ask complete: answer length={} chars", answer.len());
 
-    Ok(Json(sign_response(&state.eph_kp, AskResponse { answer, memories_used, memories })))
+    Ok(Json(sign_response(&state.eph_kp, INTENT_ASK, AskResponse { answer, memories_used, memories })))
 }
 
 // ============================================================
@@ -818,7 +821,7 @@ pub async fn restore(
         .collect();
 
     if total == 0 {
-        return Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
+        return Ok(Json(sign_response(&state.eph_kp, INTENT_RESTORE, RestoreResponse {
             restored: 0,
             skipped: 0,
             total: 0,
@@ -847,7 +850,7 @@ pub async fn restore(
     );
 
     if missing_blob_ids.is_empty() {
-        return Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
+        return Ok(Json(sign_response(&state.eph_kp, INTENT_RESTORE, RestoreResponse {
             restored: 0,
             skipped,
             total,
@@ -890,7 +893,7 @@ pub async fn restore(
         .collect();
 
     if downloaded.is_empty() {
-        return Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
+        return Ok(Json(sign_response(&state.eph_kp, INTENT_RESTORE, RestoreResponse {
             restored: 0,
             skipped,
             total,
@@ -986,7 +989,7 @@ pub async fn restore(
         restored, skipped, total, owner, namespace
     );
 
-    Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
+    Ok(Json(sign_response(&state.eph_kp, INTENT_RESTORE, RestoreResponse {
         restored,
         skipped,
         total,

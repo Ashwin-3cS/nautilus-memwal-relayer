@@ -16,21 +16,45 @@
 
 import { createHash } from 'node:crypto'
 import { ed25519 } from '@noble/curves/ed25519.js'
+import { bcs } from '@mysten/bcs'
 
 // ── Signed response verification ───────────────────────────────────────────────
+//
+// The relay signs `bcs(IntentMessage { intent: u8, timestamp_ms: u64,
+// payload: vector<u8> })` where payload = sha256(canonical_json(data)).
+// This BCS layout matches the Move `verify_signature<T, vector<u8>>` function
+// in contracts/nautilus/sources/enclave.move, so the same signature is also
+// verifiable on-chain via the `verify_signed_payload` entry function.
 
 type SignedResponse<T> = {
     data: T
+    intent_scope: number
+    timestamp_ms: number
     signature: string
     enclave_public_key: string
 }
 
+const IntentMessage = bcs.struct('IntentMessage', {
+    intent: bcs.u8(),
+    timestamp_ms: bcs.u64(),
+    payload: bcs.vector(bcs.u8()),
+})
+
 function verifySignedResponse<T>(resp: SignedResponse<T>): T {
-    const payload = new TextEncoder().encode(JSON.stringify(resp.data))
+    const bodyHash = createHash('sha256')
+        .update(JSON.stringify(resp.data), 'utf8')
+        .digest()
+
+    const signedBytes = IntentMessage.serialize({
+        intent: resp.intent_scope,
+        timestamp_ms: BigInt(resp.timestamp_ms),
+        payload: Array.from(bodyHash),
+    }).toBytes()
+
     const sig = hexToBytes(resp.signature)
     const pk  = hexToBytes(resp.enclave_public_key)
-    const ok  = ed25519.verify(sig, payload, pk)
-    if (!ok) throw new Error(`Enclave signature verification FAILED`)
+    const ok  = ed25519.verify(sig, signedBytes, pk)
+    if (!ok) throw new Error(`Enclave signature verification FAILED (intent=${resp.intent_scope})`)
     return resp.data
 }
 
