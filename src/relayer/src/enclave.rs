@@ -14,11 +14,12 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use nautilus_enclave::EnclaveKeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
 
-use crate::types::AppState;
+use crate::types::{AppState, SignedResponse};
 
 // ── In-memory ring buffer for the /logs endpoint ──────────────────────────
 
@@ -47,6 +48,20 @@ impl LogBuffer {
     pub fn recent(&self, n: usize) -> Vec<String> {
         let buf = self.lines.lock().unwrap();
         buf.iter().rev().take(n).rev().cloned().collect()
+    }
+}
+
+// ── Signed response helper ────────────────────────────────────────────────
+
+/// Sign `data` with the enclave ephemeral keypair and return the wrapper.
+/// The signature covers the canonical JSON serialization of `data`.
+pub fn sign_response<T: Serialize>(kp: &EnclaveKeyPair, data: T) -> SignedResponse<T> {
+    let json_bytes = serde_json::to_vec(&data).expect("serialization is infallible");
+    let sig = kp.sign(&json_bytes);
+    SignedResponse {
+        data,
+        signature: hex::encode(sig.to_bytes()),
+        enclave_public_key: hex::encode(kp.public_key_bytes()),
     }
 }
 

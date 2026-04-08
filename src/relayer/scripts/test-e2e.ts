@@ -17,6 +17,23 @@
 import { createHash } from 'node:crypto'
 import { ed25519 } from '@noble/curves/ed25519.js'
 
+// ── Signed response verification ───────────────────────────────────────────────
+
+type SignedResponse<T> = {
+    data: T
+    signature: string
+    enclave_public_key: string
+}
+
+function verifySignedResponse<T>(resp: SignedResponse<T>): T {
+    const payload = new TextEncoder().encode(JSON.stringify(resp.data))
+    const sig = hexToBytes(resp.signature)
+    const pk  = hexToBytes(resp.enclave_public_key)
+    const ok  = ed25519.verify(sig, payload, pk)
+    if (!ok) throw new Error(`Enclave signature verification FAILED`)
+    return resp.data
+}
+
 // ── Config ─────────────────────────────────────────────────────────────────────
 
 const SERVER_URL  = process.env.MEMWAL_SERVER_URL  ?? 'http://13.203.196.47:4000'
@@ -75,7 +92,7 @@ async function testHealth() {
     const resp = await fetch(`${SERVER_URL}/health`)
     const body = await resp.json()
     if (!resp.ok) throw new Error(`Health failed: ${JSON.stringify(body)}`)
-    console.log('  ✓', body)
+    console.log('  ok', body)
 }
 
 async function testRemember(): Promise<string> {
@@ -85,28 +102,31 @@ async function testRemember(): Promise<string> {
         `MemWal TEE enclave uses VSOCK bridging, SEAL encryption, ` +
         `and Walrus decentralized storage for privacy-preserving memory.`
 
-    const result = await signedPost('/api/remember', { text, namespace: 'e2e-test' }) as {
+    const raw = await signedPost('/api/remember', { text, namespace: 'e2e-test' }) as SignedResponse<{
         id: string; blob_id: string; owner: string; namespace: string
-    }
+    }>
+    const result = verifySignedResponse(raw)
 
-    console.log('  ✓ stored')
+    console.log('  stored (enclave signature verified)')
     console.log('      id:       ', result.id)
     console.log('      blob_id:  ', result.blob_id)
     console.log('      owner:    ', result.owner)
     console.log('      namespace:', result.namespace)
+    console.log('      pubkey:   ', raw.enclave_public_key)
     return result.blob_id
 }
 
 async function testRecall(expectedBlobId: string) {
     console.log('\n── 3. Recall ─────────────────────────────────────────────────')
 
-    const result = await signedPost('/api/recall', {
+    const raw = await signedPost('/api/recall', {
         query: 'TEE enclave privacy SEAL Walrus',
         namespace: 'e2e-test',
         limit: 5,
-    }) as { results: Array<{ blob_id: string; text: string; distance: number }>; total: number }
+    }) as SignedResponse<{ results: Array<{ blob_id: string; text: string; distance: number }>; total: number }>
+    const result = verifySignedResponse(raw)
 
-    console.log(`  ✓ ${result.total} result(s)`)
+    console.log(`  ${result.total} result(s) (enclave signature verified)`)
     for (const [i, r] of result.results.entries()) {
         console.log(`\n  [${i + 1}] distance: ${r.distance.toFixed(4)}`)
         console.log(`       blob_id:  ${r.blob_id}`)
@@ -114,9 +134,9 @@ async function testRecall(expectedBlobId: string) {
     }
 
     if (result.results.some(r => r.blob_id === expectedBlobId)) {
-        console.log(`\n  ✓ remembered blob found in recall results`)
+        console.log(`\n  remembered blob found in recall results`)
     } else {
-        console.warn(`\n  ⚠ blob ${expectedBlobId} not in top results (Walrus propagation or dim mismatch)`)
+        console.warn(`\n  blob ${expectedBlobId} not in top results (Walrus propagation or dim mismatch)`)
     }
 }
 
@@ -132,14 +152,14 @@ async function main() {
         await testHealth()
         const blobId = await testRemember()
 
-        console.log('\n  ⏳ waiting 3s for Walrus propagation...')
+        console.log('\n  waiting 3s for Walrus propagation...')
         await new Promise(r => setTimeout(r, 3000))
 
         await testRecall(blobId)
 
-        console.log('\n✅ E2E test passed\n')
+        console.log('\nE2E test passed\n')
     } catch (err) {
-        console.error('\n❌ E2E test failed:', err)
+        console.error('\nE2E test failed:', err)
         process.exit(1)
     }
 }

@@ -4,6 +4,7 @@ use axum::response::Response;
 use base64::Engine as _;
 use std::sync::Arc;
 
+use crate::enclave::sign_response;
 use crate::seal;
 use crate::walrus;
 use crate::rate_limit;
@@ -115,7 +116,7 @@ pub async fn remember(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RememberRequest>,
-) -> Result<Json<RememberResponse>, AppError> {
+) -> Result<Json<SignedResponse<RememberResponse>>, AppError> {
     if body.text.is_empty() {
         return Err(AppError::BadRequest("Text cannot be empty".into()));
     }
@@ -160,12 +161,12 @@ pub async fn remember(
         blob_id, owner, namespace, vector.len()
     );
 
-    Ok(Json(RememberResponse {
+    Ok(Json(sign_response(&state.eph_kp, RememberResponse {
         id,
         blob_id,
         owner: owner.clone(),
         namespace: namespace.clone(),
-    }))
+    })))
 }
 
 /// POST /api/recall
@@ -180,7 +181,7 @@ pub async fn recall(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RecallRequest>,
-) -> Result<Json<RecallResponse>, AppError> {
+) -> Result<Json<SignedResponse<RecallResponse>>, AppError> {
     if body.query.is_empty() {
         return Err(AppError::BadRequest("Query cannot be empty".into()));
     }
@@ -265,7 +266,7 @@ pub async fn recall(
     let total = results.len();
     tracing::info!("recall complete: {} results for owner={}", total, owner);
 
-    Ok(Json(RecallResponse { results, total }))
+    Ok(Json(sign_response(&state.eph_kp, RecallResponse { results, total })))
 }
 
 
@@ -281,7 +282,7 @@ pub async fn remember_manual(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RememberManualRequest>,
-) -> Result<Json<RememberManualResponse>, AppError> {
+) -> Result<Json<SignedResponse<RememberManualResponse>>, AppError> {
     if body.encrypted_data.is_empty() {
         return Err(AppError::BadRequest("encrypted_data cannot be empty".into()));
     }
@@ -331,12 +332,12 @@ pub async fn remember_manual(
 
     tracing::info!("remember_manual complete: id={}, blob_id={}, ns={}", id, blob_id, namespace);
 
-    Ok(Json(RememberManualResponse {
+    Ok(Json(sign_response(&state.eph_kp, RememberManualResponse {
         id,
         blob_id,
         owner: owner.clone(),
         namespace: namespace.clone(),
-    }))
+    })))
 }
 
 
@@ -349,7 +350,7 @@ pub async fn recall_manual(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RecallManualRequest>,
-) -> Result<Json<RecallManualResponse>, AppError> {
+) -> Result<Json<SignedResponse<RecallManualResponse>>, AppError> {
     if body.vector.is_empty() {
         return Err(AppError::BadRequest("vector cannot be empty".into()));
     }
@@ -367,10 +368,10 @@ pub async fn recall_manual(
 
     tracing::info!("recall_manual complete: {} results for owner={} ns={}", total, owner, namespace);
 
-    Ok(Json(RecallManualResponse {
+    Ok(Json(sign_response(&state.eph_kp, RecallManualResponse {
         results: hits,
         total,
-    }))
+    })))
 }
 
 /// POST /api/analyze
@@ -383,7 +384,7 @@ pub async fn analyze(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<AnalyzeRequest>,
-) -> Result<Json<AnalyzeResponse>, AppError> {
+) -> Result<Json<SignedResponse<AnalyzeResponse>>, AppError> {
     if body.text.is_empty() {
         return Err(AppError::BadRequest("Text cannot be empty".into()));
     }
@@ -397,11 +398,11 @@ pub async fn analyze(
     tracing::info!("  → Extracted {} facts", facts.len());
 
     if facts.is_empty() {
-        return Ok(Json(AnalyzeResponse {
+        return Ok(Json(sign_response(&state.eph_kp, AnalyzeResponse {
             facts: vec![],
             total: 0,
             owner: owner.clone(),
-        }));
+        })));
     }
 
     // Check storage quota before processing all facts
@@ -463,11 +464,11 @@ pub async fn analyze(
     let total = stored_facts.len();
     tracing::info!("analyze complete: {} facts stored for owner={}", total, owner);
 
-    Ok(Json(AnalyzeResponse {
+    Ok(Json(sign_response(&state.eph_kp, AnalyzeResponse {
         facts: stored_facts,
         total,
         owner: owner.clone(),
-    }))
+    })))
 }
 
 // ============================================================
@@ -609,7 +610,7 @@ pub async fn ask(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<AskRequest>,
-) -> Result<Json<AskResponse>, AppError> {
+) -> Result<Json<SignedResponse<AskResponse>>, AppError> {
     if body.question.is_empty() {
         return Err(AppError::BadRequest("Question cannot be empty".into()));
     }
@@ -736,7 +737,7 @@ pub async fn ask(
 
     tracing::info!("ask complete: answer length={} chars", answer.len());
 
-    Ok(Json(AskResponse { answer, memories_used, memories }))
+    Ok(Json(sign_response(&state.eph_kp, AskResponse { answer, memories_used, memories })))
 }
 
 // ============================================================
@@ -779,7 +780,7 @@ pub async fn restore(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RestoreRequest>,
-) -> Result<Json<RestoreResponse>, AppError> {
+) -> Result<Json<SignedResponse<RestoreResponse>>, AppError> {
     if body.namespace.is_empty() {
         return Err(AppError::BadRequest("namespace cannot be empty".into()));
     }
@@ -817,13 +818,13 @@ pub async fn restore(
         .collect();
 
     if total == 0 {
-        return Ok(Json(RestoreResponse {
+        return Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
             restored: 0,
             skipped: 0,
             total: 0,
             namespace: namespace.clone(),
             owner: owner.clone(),
-        }));
+        })));
     }
 
     // Step 2: Check which blobs already exist in local DB → only restore missing ones
@@ -846,13 +847,13 @@ pub async fn restore(
     );
 
     if missing_blob_ids.is_empty() {
-        return Ok(Json(RestoreResponse {
+        return Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
             restored: 0,
             skipped,
             total,
             namespace: namespace.clone(),
             owner: owner.clone(),
-        }));
+        })));
     }
 
     // Step 3: Download all missing blobs from Walrus concurrently
@@ -889,13 +890,13 @@ pub async fn restore(
         .collect();
 
     if downloaded.is_empty() {
-        return Ok(Json(RestoreResponse {
+        return Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
             restored: 0,
             skipped,
             total,
             namespace: namespace.clone(),
             owner: owner.clone(),
-        }));
+        })));
     }
 
     tracing::info!("restore: downloaded {}/{} blobs, decrypting (3 concurrent)...", downloaded.len(), missing_blob_ids.len());
@@ -985,13 +986,13 @@ pub async fn restore(
         restored, skipped, total, owner, namespace
     );
 
-    Ok(Json(RestoreResponse {
+    Ok(Json(sign_response(&state.eph_kp, RestoreResponse {
         restored,
         skipped,
         total,
         namespace: namespace.clone(),
         owner: owner.clone(),
-    }))
+    })))
 }
 
 // ============================================================

@@ -333,6 +333,27 @@ pub struct HealthResponse {
 }
 
 // ============================================================
+// Signed enclave response wrapper
+// ============================================================
+
+/// Wraps every protected API response with an Ed25519 signature from the
+/// enclave ephemeral key.  Clients can verify the signature against the
+/// public key returned from GET /enclave_health, which is bound to the
+/// enclave PCRs via GET /get_attestation.
+///
+/// Verification (TypeScript / @noble/ed25519):
+///   const payload = new TextEncoder().encode(JSON.stringify(data));
+///   ed25519.verify(fromHex(signature), payload, fromHex(enclave_public_key))
+#[derive(Debug, Serialize)]
+pub struct SignedResponse<T: Serialize> {
+    pub data: T,
+    /// Hex-encoded Ed25519 signature over the canonical JSON bytes of `data`.
+    pub signature: String,
+    /// Hex-encoded enclave ephemeral Ed25519 public key.
+    pub enclave_public_key: String,
+}
+
+// ============================================================
 // Auth Types
 // ============================================================
 
