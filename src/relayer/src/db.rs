@@ -1,6 +1,7 @@
 use pgvector::Vector;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use std::str::FromStr;
 
 use crate::types::{AppError, SearchHit};
 
@@ -15,12 +16,15 @@ impl VectorDb {
 
     /// Initialize database connection pool and run migrations
     pub async fn new(database_url: &str) -> Result<Self, AppError> {
+        // Supabase pooler (PgBouncer, transaction mode) doesn't support
+        // named prepared statements — disable the cache to avoid conflicts.
+        let connect_opts = PgConnectOptions::from_str(database_url)
+            .map_err(|e| AppError::Internal(format!("Invalid DATABASE_URL: {}", e)))?
+            .statement_cache_capacity(0);
+
         let pool = PgPoolOptions::new()
             .max_connections(10)
-            // Supabase pooler (PgBouncer, transaction mode) doesn't support
-            // named prepared statements — disable the cache to avoid conflicts.
-            .statement_cache_capacity(0)
-            .connect(database_url)
+            .connect_with(connect_opts)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;
 
