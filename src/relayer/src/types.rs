@@ -1,7 +1,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use nautilus_enclave::EnclaveKeyPair;
 use serde::{Deserialize, Serialize};
 
 use crate::db::VectorDb;
+use crate::enclave::LogBuffer;
 use crate::rate_limit::RateLimitConfig;
 
 // ============================================================
@@ -18,6 +21,11 @@ pub struct AppState {
     pub key_pool: KeyPool,
     /// Redis multiplexed connection for rate limiting
     pub redis: redis::aio::MultiplexedConnection,
+    /// Ephemeral Ed25519 keypair generated on startup (NSM entropy in enclave).
+    /// Used for signing responses and binding to NSM attestation docs.
+    pub eph_kp: EnclaveKeyPair,
+    /// In-memory ring buffer for the /logs endpoint.
+    pub logs: Arc<LogBuffer>,
 }
 
 // ============================================================

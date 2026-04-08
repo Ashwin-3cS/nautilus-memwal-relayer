@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod enclave;
 mod rate_limit;
 mod routes;
 mod seal;
@@ -8,11 +9,13 @@ mod types;
 mod walrus;
 
 use axum::{middleware, routing::{get, post}, Router};
+use nautilus_enclave::EnclaveKeyPair;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use db::VectorDb;
+use enclave::{enclave_health, get_attestation, get_logs, LogBuffer};
 use types::{AppState, Config, KeyPool};
 
 #[tokio::main]
@@ -152,6 +155,16 @@ async fn main() {
         .expect("Failed to connect to Redis for rate limiting");
     tracing::info!("  Redis: connected at {}", config.rate_limit.redis_url);
 
+    // Generate the enclave ephemeral keypair (uses NSM entropy in AWS Nitro).
+    // The public key is bound to the enclave image via /get_attestation.
+    let eph_kp = EnclaveKeyPair::generate();
+    tracing::info!(
+        "  enclave pubkey: {}",
+        hex::encode(eph_kp.public_key_bytes())
+    );
+
+    let logs = Arc::new(LogBuffer::new(1000));
+
     // Shared application state
     let state = Arc::new(AppState {
         db,
@@ -160,6 +173,8 @@ async fn main() {
         walrus_client,
         key_pool,
         redis,
+        eph_kp,
+        logs,
     });
 
     // Build routes
@@ -190,9 +205,16 @@ async fn main() {
         .route("/sponsor", post(routes::sponsor_proxy))
         .route("/sponsor/execute", post(routes::sponsor_execute_proxy));
 
+    // Nautilus enclave routes — attestation, enclave health, in-memory logs
+    let enclave_routes = Router::new()
+        .route("/get_attestation", get(get_attestation))
+        .route("/enclave_health", get(enclave_health))
+        .route("/logs", get(get_logs));
+
     let app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
+        .merge(enclave_routes)
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
