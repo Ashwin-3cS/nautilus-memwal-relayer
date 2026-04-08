@@ -130,6 +130,11 @@ fi
 
 setup_outbound_proxy "openai" "$OPENAI_API_BASE" "127.0.0.7" "$OPENAI_PROXY_VSOCK_PORT"
 
+# Embedding proxy — only when EMBEDDING_API_BASE is set and differs from OPENAI_API_BASE
+if [ -n "$EMBEDDING_API_BASE" ] && [ "$EMBEDDING_API_BASE" != "$OPENAI_API_BASE" ]; then
+    setup_outbound_proxy "embedding" "$EMBEDDING_API_BASE" "127.0.0.9" "$EMBEDDING_PROXY_VSOCK_PORT"
+fi
+
 # SEAL key servers: loop over comma-separated SEAL_KEY_SERVER_URLS
 SEAL_IDX=0
 IFS=','
