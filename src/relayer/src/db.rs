@@ -17,6 +17,9 @@ impl VectorDb {
     pub async fn new(database_url: &str) -> Result<Self, AppError> {
         let pool = PgPoolOptions::new()
             .max_connections(10)
+            // Supabase pooler (PgBouncer, transaction mode) doesn't support
+            // named prepared statements — disable the cache to avoid conflicts.
+            .statement_cache_capacity(0)
             .connect(database_url)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;
