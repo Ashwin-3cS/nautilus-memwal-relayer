@@ -6,3 +6,4 @@ src/relayer/scripts/node_modules/
 .env.runtime
 .env.memwal
 *.log
+contracts/nautilus/build

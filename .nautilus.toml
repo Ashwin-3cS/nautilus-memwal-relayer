@@ -1,2 +1,9 @@
 [project]
 template = "memwal-relayer"
+
+[sui]
+network = "testnet"
+package_id = "0x67818d74a5359beaf11cfb18be224bc98b08d8e964bc39303e6a46c7749ffff9"
+config_object_id = "0xc976c885a6fb856f667c60155536f038a788b10d566b6428e00c33245a8690e8"
+cap_object_id = "0x0849cecd82e088224a6c85e5cfe48740e5b27ddaa6e87d3878ca2cdd1f02db51"
+enclave_id = "0x48acfd6806135f270d369a4bb09bd7cfcca8591f536172385ea337de83904a4d"
