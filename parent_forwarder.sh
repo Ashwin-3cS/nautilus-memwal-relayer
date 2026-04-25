@@ -111,10 +111,18 @@ if [ -n "$DATABASE_URL" ]; then
     fi
 fi
 
-# Redis: extract host:port from REDIS_URL (redis://host:port)
+# Redis: extract host:port from REDIS_URL.
+# Supports both auth form (rediss://user:pass@host:port — Upstash) and simple
+# form (redis://host:port). Auth-aware regex tried first, then plain form.
 if [ -n "$REDIS_URL" ]; then
-    REDIS_HOST=$(extract_url_host "$REDIS_URL")
-    REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[^:]+://[^:]+:([0-9]+).*#\1#p')
+    REDIS_HOST=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[a-z]+://([^:@]+:)?[^@]+@([^:/@]+).*#\2#p')
+    if [ -z "$REDIS_HOST" ]; then
+        REDIS_HOST=$(extract_url_host "$REDIS_URL")
+    fi
+    REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#.*@[^:/@]+:([0-9]+).*#\1#p')
+    if [ -z "$REDIS_PORT" ]; then
+        REDIS_PORT=$(printf '%s' "$REDIS_URL" | sed -nE 's#^[a-z]+://[^:/@]+:([0-9]+).*#\1#p')
+    fi
     REDIS_PORT="${REDIS_PORT:-6379}"
     if [ -n "$REDIS_HOST" ]; then
         echo "Forwarding enclave VSOCK:${REDIS_PROXY_VSOCK_PORT} -> ${REDIS_HOST}:${REDIS_PORT}"
