@@ -154,17 +154,8 @@ jobs:
           sudo nitro-cli run-enclave \
             --cpu-count 2 \
             --memory 4096 \
-            --eif-path ~/nautilus-app/out/nitro.eif \
-            --debug-mode
+            --eif-path ~/nautilus-app/out/nitro.eif
 
-          # In debug mode, capture serial console output via systemd-run so
-          # the process survives SSH session end. Streams to a host file we
-          # can tail on health-check failure.
-          ENCLAVE_ID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveID')
-          sudo systemctl stop nautilus-console.service 2>/dev/null || true
-          sudo truncate -s 0 /tmp/enclave-console.log 2>/dev/null || true
-          sudo systemd-run --unit=nautilus-console --collect \
-            bash -c "nitro-cli console --enclave-id $ENCLAVE_ID > /tmp/enclave-console.log 2>&1" || true
           sudo nitro-cli describe-enclaves | jq -r '.[0] | "CID: \(.EnclaveCID)  State: \(.State)"'
           REMOTE
           rm -f /tmp/deploy_key
@@ -405,8 +396,6 @@ jobs:
           tail -50 /tmp/enclave.log 2>/dev/null || true
           echo "--- Sidecar log ---"
           tail -20 /tmp/sidecar.log 2>/dev/null || true
-          echo "--- Enclave console (debug-mode) ---"
-          tail -100 /tmp/enclave-console.log 2>/dev/null || true
           exit 1
           REMOTE
           rm -f /tmp/deploy_key
