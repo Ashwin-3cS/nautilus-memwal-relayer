@@ -5,7 +5,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::VectorDb;
 use crate::enclave::LogBuffer;
+use crate::jobs::{BulkRememberJobStorage, RememberJobStorage, WalletJobStorage};
 use crate::rate_limit::RateLimitConfig;
+
+// ============================================================
+// Cache constants (Redis-backed)
+// ============================================================
+
+/// Redis key prefix for Walrus ciphertext cache entries.
+pub const BLOB_CACHE_KEY_PREFIX: &str = "memwal:blob:v1:";
+
+/// Default max age for Redis-cached Walrus ciphertext before revalidating.
+pub const DEFAULT_BLOB_CACHE_TTL_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// Default maximum ciphertext size stored in Redis.
+pub const DEFAULT_BLOB_CACHE_MAX_BYTES: usize = 512 * 1024;
+
+/// Default max age for Redis-cached recall query embeddings.
+pub const DEFAULT_EMBEDDING_CACHE_TTL_SECS: u64 = 10 * 60;
 
 // ============================================================
 // App State (shared across routes + middleware)
@@ -26,6 +43,22 @@ pub struct AppState {
     pub eph_kp: EnclaveKeyPair,
     /// In-memory ring buffer for the /logs endpoint.
     pub logs: Arc<LogBuffer>,
+    /// Apalis storage for RememberJob — legacy full async pipeline.
+    /// New requests use WalletJob::UploadAndTransfer instead.
+    #[allow(dead_code)]
+    pub remember_job_storage: RememberJobStorage,
+    /// Single Apalis storage for WalletJob (MEM-35: single wallet + retry).
+    pub wallet_storage: WalletJobStorage,
+    /// ENG-1408: Apalis storage for BulkRememberJob.
+    #[allow(dead_code)]
+    pub bulk_job_storage: BulkRememberJobStorage,
+    /// ENG-1405: Redis TTL for Walrus blob ciphertext cache entries.
+    pub blob_cache_ttl: std::time::Duration,
+    /// MEM-37: Maximum SEAL ciphertext bytes to cache in Redis.
+    pub blob_cache_max_bytes: usize,
+    /// ENG-1405: Redis TTL for recall query embedding cache entries.
+    #[allow(dead_code)]
+    pub embedding_cache_ttl: std::time::Duration,
 }
 
 // ============================================================
@@ -49,12 +82,22 @@ impl KeyPool {
     }
 
     /// Returns the next key in round-robin order, or `None` if the pool is empty.
+    #[allow(dead_code)]
     pub fn next(&self) -> Option<&str> {
         if self.keys.is_empty() {
             return None;
         }
         let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.keys.len();
         Some(&self.keys[idx])
+    }
+
+    /// Returns the next key index (round-robin), or `None` if pool is empty.
+    /// Sidecar maps this back to a private key via SERVER_SUI_PRIVATE_KEYS.
+    pub fn next_index(&self) -> Option<usize> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        Some(self.counter.fetch_add(1, Ordering::Relaxed) % self.keys.len())
     }
 
     #[allow(dead_code)]
@@ -92,6 +135,12 @@ pub struct Config {
     pub registry_id: String,
     /// URL of the SEAL/Walrus TS sidecar HTTP server
     pub sidecar_url: String,
+    /// Shared secret for authenticating Rust→sidecar calls (X-Sidecar-Secret header)
+    pub sidecar_secret: Option<String>,
+    /// Sui network name (mainnet/testnet/devnet) — surfaced via GET /config
+    pub sui_network: String,
+    /// Allowed CORS origins (comma-separated)
+    pub allowed_origins: String,
     /// Rate limiting configuration
     pub rate_limit: RateLimitConfig,
 }
@@ -152,6 +201,9 @@ impl Config {
                 .expect("MEMWAL_REGISTRY_ID must be set"),
             sidecar_url: std::env::var("SIDECAR_URL")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
+            sidecar_secret: std::env::var("SIDECAR_AUTH_TOKEN").ok(),
+            sui_network: network.clone(),
+            allowed_origins: std::env::var("ALLOWED_ORIGINS").unwrap_or_default(),
             rate_limit: RateLimitConfig::from_env(),
         }
     }
@@ -172,6 +224,57 @@ pub struct RememberRequest {
     pub namespace: String,
 }
 
+/// POST /api/remember — accepted job response (inside SignedResponse)
+#[derive(Debug, Serialize)]
+pub struct RememberAcceptedResponse {
+    pub job_id: String,
+    pub status: String,
+}
+
+/// GET /api/remember/:job_id — job status polling (plain JSON, not SignedResponse)
+#[derive(Debug, Serialize)]
+pub struct RememberJobStatusResponse {
+    pub job_id: String,
+    pub status: String,
+    pub owner: String,
+    pub namespace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST /api/remember/bulk — accepted bulk job response (plain JSON)
+#[derive(Debug, Serialize)]
+pub struct RememberBulkAcceptedResponse {
+    pub job_ids: Vec<String>,
+    pub total: usize,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RememberBulkItem {
+    pub text: String,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RememberBulkRequest {
+    pub items: Vec<RememberBulkItem>,
+}
+
+/// GET /config — public network config (plain JSON)
+#[derive(Debug, Serialize)]
+pub struct ConfigResponse {
+    #[serde(rename = "packageId")]
+    pub package_id: String,
+    pub network: String,
+    #[serde(rename = "suiRpcUrl")]
+    pub sui_rpc_url: String,
+}
+
+/// Legacy sync remember response — kept for RememberManual return shape
 #[derive(Debug, Serialize)]
 pub struct RememberResponse {
     pub id: String,
@@ -243,6 +346,25 @@ pub struct AnalyzedFact {
 pub struct AnalyzeResponse {
     pub facts: Vec<AnalyzedFact>,
     pub total: usize,
+    pub owner: String,
+}
+
+/// Per-fact entry in the analyze 202 response.
+#[derive(Debug, Serialize)]
+pub struct AnalyzeAcceptedFact {
+    pub text: String,
+    pub id: String,
+    pub job_id: String,
+}
+
+/// 202-style response: analyze accepted facts and enqueued upload jobs.
+/// Clients poll GET /api/remember/{job_id} for each id.
+#[derive(Debug, Serialize)]
+pub struct AnalyzeAcceptedResponse {
+    pub job_ids: Vec<String>,
+    pub facts: Vec<AnalyzeAcceptedFact>,
+    pub fact_count: usize,
+    pub status: String,
     pub owner: String,
 }
 
@@ -377,6 +499,8 @@ pub struct AuthInfo {
     pub account_id: String,
     /// Delegate private key (hex) — used for SEAL decrypt SessionKey
     pub delegate_key: Option<String>,
+    /// SEAL SessionKey (base64 JSON) — modern replacement for delegate_key on the wire.
+    pub seal_session: Option<String>,
 }
 
 // ============================================================

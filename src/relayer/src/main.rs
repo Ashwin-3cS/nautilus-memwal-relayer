@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod enclave;
+mod jobs;
 mod rate_limit;
 mod routes;
 mod seal;
@@ -14,9 +15,21 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use apalis::prelude::*;
+use apalis_sql::postgres::PostgresStorage;
+
 use db::VectorDb;
 use enclave::{enclave_health, get_attestation, get_logs, LogBuffer};
-use types::{AppState, Config, KeyPool};
+use jobs::{
+    execute_bulk_remember, execute_wallet_job, BulkRememberJob, MetaTransferJob, RememberJob,
+    WalletJobStorage,
+};
+use types::{
+    AppState, Config, KeyPool, DEFAULT_BLOB_CACHE_MAX_BYTES, DEFAULT_BLOB_CACHE_TTL_SECS,
+    DEFAULT_EMBEDDING_CACHE_TTL_SECS,
+};
+
+const APALIS_MONITOR_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() {
@@ -111,9 +124,9 @@ async fn main() {
     // Warn if the DB vector column dimension doesn't match EMBEDDING_DIMENSIONS
     if let Some(expected_dim) = config.embedding_dimensions {
         let dim_check: Result<Option<i32>, _> = sqlx::query_scalar(
-            "SELECT atttypmod - 4 FROM pg_attribute a \
+            "SELECT atttypmod FROM pg_attribute a \
              JOIN pg_class c ON a.attrelid = c.oid \
-             WHERE c.relname = 'vector_entries' AND a.attname = 'embedding'"
+             WHERE c.relname = 'vector_entries' AND a.attname = 'embedding' AND a.attnum > 0"
         )
         .fetch_optional(db.pool())
         .await;
@@ -165,6 +178,52 @@ async fn main() {
 
     let logs = Arc::new(LogBuffer::new(1000));
 
+    // ── Apalis: Postgres-backed job queue ─────────────────────────────────
+    let apalis_pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("Failed to connect to PostgreSQL for Apalis");
+    PostgresStorage::<()>::setup(&apalis_pool)
+        .await
+        .expect("Apalis postgres migration failed");
+    let job_storage: PostgresStorage<MetaTransferJob> = PostgresStorage::new(apalis_pool.clone());
+    let remember_job_storage: PostgresStorage<RememberJob> =
+        PostgresStorage::new(apalis_pool.clone());
+    let bulk_job_storage: PostgresStorage<BulkRememberJob> =
+        PostgresStorage::new(apalis_pool.clone());
+
+    // Single Apalis queue for all WalletJob signing operations (MEM-35).
+    const WALLET_QUEUE_NAME: &str = "wallet_jobs";
+    let wallet_storage: WalletJobStorage = PostgresStorage::new_with_config(
+        apalis_pool.clone(),
+        apalis_sql::Config::new(WALLET_QUEUE_NAME),
+    );
+    tracing::info!(
+        "  Apalis: job queue ready (table=apalis_jobs, queue={})",
+        WALLET_QUEUE_NAME
+    );
+
+    // Cache TTL config (Redis-backed blob ciphertext + embedding caches)
+    let blob_cache_ttl_secs = std::env::var("BLOB_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BLOB_CACHE_TTL_SECS);
+    let blob_cache_max_bytes = std::env::var("BLOB_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_BLOB_CACHE_MAX_BYTES);
+    let embedding_cache_ttl_secs = std::env::var("EMBEDDING_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_EMBEDDING_CACHE_TTL_SECS);
+    let blob_cache_ttl = std::time::Duration::from_secs(blob_cache_ttl_secs);
+    let embedding_cache_ttl = std::time::Duration::from_secs(embedding_cache_ttl_secs);
+    tracing::info!(
+        "  blob cache: ttl={}s max={}B; embedding cache: ttl={}s",
+        blob_cache_ttl_secs,
+        blob_cache_max_bytes,
+        embedding_cache_ttl_secs
+    );
+
     // Shared application state
     let state = Arc::new(AppState {
         db,
@@ -175,16 +234,108 @@ async fn main() {
         redis,
         eph_kp,
         logs,
+        remember_job_storage: remember_job_storage.clone(),
+        wallet_storage: wallet_storage.clone(),
+        bulk_job_storage: bulk_job_storage.clone(),
+        blob_cache_ttl,
+        blob_cache_max_bytes,
+        embedding_cache_ttl,
     });
+
+    // ── Apalis workers: spawn 4 monitors (meta-transfer, remember, bulk, wallet)
+    {
+        let worker_state = state.clone();
+        let storage = job_storage.clone();
+        tokio::spawn(async move {
+            loop {
+                let worker = WorkerBuilder::new("meta-transfer")
+                    .data(worker_state.clone())
+                    .backend(storage.clone())
+                    .build_fn(jobs::execute_meta_transfer);
+                #[allow(deprecated)]
+                if let Err(e) = Monitor::new().register_with_count(2, worker).run().await {
+                    tracing::error!("Apalis meta-transfer monitor exited: {}", e);
+                }
+                tokio::time::sleep(APALIS_MONITOR_RESTART_DELAY).await;
+            }
+        });
+        tracing::info!("  Apalis: worker 'meta-transfer' spawned (concurrency=2)");
+    }
+    {
+        let worker_state = state.clone();
+        let storage = remember_job_storage.clone();
+        tokio::spawn(async move {
+            loop {
+                let worker = WorkerBuilder::new("remember")
+                    .data(worker_state.clone())
+                    .backend(storage.clone())
+                    .build_fn(jobs::execute_remember);
+                #[allow(deprecated)]
+                if let Err(e) = Monitor::new().register_with_count(3, worker).run().await {
+                    tracing::error!("Apalis remember monitor exited: {}", e);
+                }
+                tokio::time::sleep(APALIS_MONITOR_RESTART_DELAY).await;
+            }
+        });
+        tracing::info!("  Apalis: worker 'remember' spawned (concurrency=3)");
+    }
+    {
+        let worker_state = state.clone();
+        let storage = bulk_job_storage.clone();
+        tokio::spawn(async move {
+            loop {
+                let worker = WorkerBuilder::new("bulk-remember")
+                    .data(worker_state.clone())
+                    .backend(storage.clone())
+                    .build_fn(execute_bulk_remember);
+                #[allow(deprecated)]
+                if let Err(e) = Monitor::new().register_with_count(2, worker).run().await {
+                    tracing::error!("Apalis bulk-remember monitor exited: {}", e);
+                }
+                tokio::time::sleep(APALIS_MONITOR_RESTART_DELAY).await;
+            }
+        });
+        tracing::info!("  Apalis: worker 'bulk-remember' spawned (concurrency=2)");
+    }
+    let wallet_concurrency: usize = std::env::var("WALLET_JOB_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    {
+        let worker_state = state.clone();
+        let storage = wallet_storage.clone();
+        tokio::spawn(async move {
+            loop {
+                let worker = WorkerBuilder::new("wallet_jobs")
+                    .data(worker_state.clone())
+                    .backend(storage.clone())
+                    .build_fn(execute_wallet_job);
+                #[allow(deprecated)]
+                if let Err(e) = Monitor::new()
+                    .register_with_count(wallet_concurrency, worker)
+                    .run()
+                    .await
+                {
+                    tracing::error!("Apalis wallet worker exited: {}", e);
+                }
+                tokio::time::sleep(APALIS_MONITOR_RESTART_DELAY).await;
+            }
+        });
+        tracing::info!(
+            "  Apalis: worker 'wallet_jobs' spawned (concurrency={})",
+            wallet_concurrency
+        );
+    }
 
     // Build routes
     // Protected routes (require Ed25519 signature + onchain verification)
     let protected_routes = Router::new()
         .route("/api/remember", post(routes::remember))
+        .route("/api/remember/{job_id}", get(routes::remember_status))
+        .route("/api/remember/bulk", post(routes::remember_bulk))
         .route("/api/recall", post(routes::recall))
         .route("/api/remember/manual", post(routes::remember_manual))
         .route("/api/recall/manual", post(routes::recall_manual))
-
         .route("/api/analyze", post(routes::analyze))
         .route("/api/ask", post(routes::ask))
         .route("/api/restore", post(routes::restore))
@@ -202,6 +353,7 @@ async fn main() {
     // Public routes
     let public_routes = Router::new()
         .route("/health", get(routes::health))
+        .route("/config", get(routes::get_config))
         .route("/sponsor", post(routes::sponsor_proxy))
         .route("/sponsor/execute", post(routes::sponsor_execute_proxy));
 
