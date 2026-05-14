@@ -57,6 +57,10 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 base64 = "0.22"
 
+# Job queue (Apalis + Postgres backend) — matches MemWal services/server
+apalis     = { version = "0.7", default-features = false, features = ["tracing"] }
+apalis-sql = { version = "0.7", features = ["postgres", "migrate"] }
+
 [features]
 default = []
 aws = ["nautilus-enclave/nsm"]
