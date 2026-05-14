@@ -40,6 +40,7 @@ struct SealDecryptResponse {
 pub async fn seal_encrypt(
     client: &reqwest::Client,
     sidecar_url: &str,
+    sidecar_token: Option<&str>,
     data: &[u8],
     owner_address: &str,
     package_id: &str,
@@ -47,14 +48,17 @@ pub async fn seal_encrypt(
     let url = format!("{}/seal/encrypt", sidecar_url);
     let data_b64 = BASE64.encode(data);
 
-    let resp = client
+    let mut req = client
         .post(&url)
         .json(&SealEncryptRequest {
             data: data_b64,
             owner: owner_address.to_string(),
             package_id: package_id.to_string(),
-        })
-        .send()
+        });
+    if let Some(token) = sidecar_token {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    let resp = req.send()
         .await
         .map_err(|e| {
             AppError::Internal(format!("Sidecar seal/encrypt request failed: {}. Is the sidecar running?", e))
@@ -95,6 +99,7 @@ pub async fn seal_encrypt(
 pub async fn seal_decrypt(
     client: &reqwest::Client,
     sidecar_url: &str,
+    sidecar_token: Option<&str>,
     encrypted_data: &[u8],
     private_key: &str,
     package_id: &str,
@@ -103,15 +108,18 @@ pub async fn seal_decrypt(
     let url = format!("{}/seal/decrypt", sidecar_url);
     let data_b64 = BASE64.encode(encrypted_data);
 
-    let resp = client
+    let mut req = client
         .post(&url)
         .json(&SealDecryptRequest {
             data: data_b64,
             private_key: private_key.to_string(),
             package_id: package_id.to_string(),
             account_id: account_id.to_string(),
-        })
-        .send()
+        });
+    if let Some(token) = sidecar_token {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    let resp = req.send()
         .await
         .map_err(|e| {
             AppError::Internal(format!("Sidecar seal/decrypt request failed: {}. Is the sidecar running?", e))

@@ -5,11 +5,18 @@ use axum::{
     response::Response,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::sui::{find_account_by_delegate_key, verify_delegate_key_onchain};
 use crate::types::{AppState, AuthInfo};
+
+/// Constant-time 401 — normalizes timing across all failure paths.
+async fn constant_time_reject() -> StatusCode {
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    StatusCode::UNAUTHORIZED
+}
 
 /// Ed25519 signature verification + onchain delegate key verification middleware
 ///
@@ -17,14 +24,11 @@ use crate::types::{AppState, AuthInfo};
 /// - `x-public-key`: hex-encoded Ed25519 public key (32 bytes)
 /// - `x-signature`: hex-encoded Ed25519 signature (64 bytes)
 /// - `x-timestamp`: Unix timestamp (seconds)
-/// - `x-account-id` (optional): account object ID hint (skips cache/registry lookup)
+/// - `x-nonce`: UUID v4 (replay protection, SDK v0.3+)
+/// - `x-account-id` (optional): account object ID hint
 ///
-/// Flow:
-/// 1. Verify Ed25519 signature: `{timestamp}.{method}.{path}.{body_sha256}`
-/// 2. Resolve account: cache → indexed accounts → registry scan → header hint → config fallback
-/// 3. Verify onchain: public_key ∈ MemWalAccount.delegate_keys
-/// 4. Cache the mapping for future requests
-/// 5. Store AuthInfo { public_key, owner } in request extensions
+/// Signed canonical message (6-field):
+///   "{timestamp}.{method}.{path_and_query}.{body_sha256}.{nonce}.{account_id}"
 pub async fn verify_signature(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -32,7 +36,6 @@ pub async fn verify_signature(
 ) -> Result<Response, StatusCode> {
     let headers = request.headers();
 
-    // Extract auth headers as owned Strings
     let public_key_hex = headers
         .get("x-public-key")
         .and_then(|v| v.to_str().ok())
@@ -51,26 +54,45 @@ pub async fn verify_signature(
         .map(String::from)
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // Optional account ID hint from header
     let account_id_hint = headers
         .get("x-account-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Optional delegate private key (hex) for SEAL decrypt
     let delegate_key_hex = headers
         .get("x-delegate-key")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Validate timestamp (5 minute window)
+    let seal_session = headers
+        .get("x-seal-session")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    // MED-1: nonce required (SDK v0.3+); reject older clients
+    let nonce = headers
+        .get("x-nonce")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            tracing::warn!("request missing x-nonce; rejecting legacy SDK");
+            StatusCode::UPGRADE_REQUIRED
+        })?
+        .to_string();
+
+    if uuid::Uuid::parse_str(&nonce).is_err() {
+        tracing::warn!("invalid nonce format: {}", &nonce[..nonce.len().min(36)]);
+        return Err(constant_time_reject().await);
+    }
+
+    // Validate timestamp (±5 minute window) with overflow protection
     let timestamp: i64 = timestamp_str
         .parse()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let now = chrono::Utc::now().timestamp();
-    if (now - timestamp).abs() > 300 {
-        tracing::warn!("Request timestamp too old: {} (now: {})", timestamp, now);
-        return Err(StatusCode::UNAUTHORIZED);
+    let age = now.checked_sub(timestamp).unwrap_or(i64::MAX);
+    if !(-300..=300).contains(&age) {
+        tracing::warn!("timestamp out of window: {} (now: {})", timestamp, now);
+        return Err(constant_time_reject().await);
     }
 
     // Decode public key
@@ -88,71 +110,98 @@ pub async fn verify_signature(
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let signature = Signature::from_bytes(&sig_array);
 
-    // Build the signed message: "{timestamp}.{method}.{path}.{body_sha256}"
+    // Build 6-field canonical signed message
     let method = request.method().as_str().to_string();
-    let path = request.uri().path().to_string();
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
 
-    // Split request to consume body
     let (mut parts, body) = request.into_parts();
 
-    let body_bytes = axum::body::to_bytes(body, 1024 * 1024)
+    let body_bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let body_hash = hex::encode(Sha256::digest(&body_bytes));
-    let message = format!("{}.{}.{}.{}", timestamp_str, method, path, body_hash);
+    let account_id_for_sig = account_id_hint.clone().unwrap_or_default();
+    let message = format!(
+        "{}.{}.{}.{}.{}.{}",
+        timestamp_str, method, path, body_hash, nonce, account_id_for_sig
+    );
 
-    // Step 1: Verify Ed25519 signature
-    verifying_key
+    if verifying_key
         .verify(message.as_bytes(), &signature)
-        .map_err(|e| {
-            tracing::warn!("Signature verification failed: {}", e);
-            StatusCode::UNAUTHORIZED
-        })?;
+        .is_err()
+    {
+        tracing::warn!("signature verification failed for key: {}", public_key_hex);
+        return Err(constant_time_reject().await);
+    }
 
     tracing::debug!("signature verified for key: {}", public_key_hex);
 
-    // Step 2: Resolve account — cache → indexed accounts → registry scan → header hint → config fallback
-    let (account_id, owner) = resolve_account(&state, &public_key_hex, &pk_array, account_id_hint)
-        .await
-        .map_err(|e| {
-            tracing::warn!("Account resolution failed: {}", e);
-            StatusCode::UNAUTHORIZED
-        })?;
+    // MED-1: record nonce in Redis (TTL=600s > timestamp window=300s) to block replays
+    {
+        let nonce_key = format!("nonce:{}", nonce);
+        let mut redis = state.redis.clone();
+
+        let set_result: Option<String> = redis
+            .set_options(
+                &nonce_key,
+                "1",
+                redis::SetOptions::default()
+                    .conditional_set(redis::ExistenceCheck::NX)
+                    .with_expiration(redis::SetExpiry::EX(600)),
+            )
+            .await
+            .unwrap_or(None);
+
+        if set_result.is_none() {
+            tracing::warn!(
+                "replay detected: nonce {} already seen (key={}...)",
+                nonce,
+                &public_key_hex[..16.min(public_key_hex.len())]
+            );
+            return Err(constant_time_reject().await);
+        }
+    }
+
+    let (account_id, owner) =
+        match resolve_account(&state, &public_key_hex, &pk_array, account_id_hint).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("account resolution failed: {}", e);
+                return Err(constant_time_reject().await);
+            }
+        };
 
     tracing::debug!("account resolved: {} (owner: {})", account_id, owner);
 
-    // Store auth info in request extensions
     parts.extensions.insert(AuthInfo {
         public_key: public_key_hex,
         owner,
         account_id,
         delegate_key: delegate_key_hex,
+        seal_session,
     });
 
-    // Rebuild request with the body re-injected
     let request = Request::from_parts(parts, axum::body::Body::from(body_bytes));
 
     Ok(next.run(request).await)
 }
 
-/// Resolve a delegate key to its account using multiple strategies:
-/// 1. PostgreSQL cache (fastest)
-/// 2. On-chain registry scan (slower, but auto-discovers)
-/// 3. Header hint or config fallback (manual)
-///
-/// After successful resolution, the mapping is cached for future requests.
+/// Resolve delegate key → account via: cache → registry scan → header hint → config fallback.
 async fn resolve_account(
     state: &AppState,
     public_key_hex: &str,
     pk_bytes: &[u8; 32],
     account_id_hint: Option<String>,
 ) -> Result<(String, String), String> {
-    // Strategy 1: Check PostgreSQL cache
+    // Strategy 1: PostgreSQL cache
     if let Ok(Some((cached_account_id, _cached_owner))) =
         state.db.get_cached_account(public_key_hex).await
     {
-        // Verify the cached mapping is still valid onchain
         match verify_delegate_key_onchain(
             &state.http_client,
             &state.config.sui_rpc_url,
@@ -166,13 +215,12 @@ async fn resolve_account(
                 return Ok((cached_account_id, owner));
             }
             Err(_) => {
-                // Cache is stale (key was removed), continue to other strategies
                 tracing::debug!("cached account {} is stale, re-resolving", cached_account_id);
             }
         }
     }
 
-    // Strategy 2: Scan AccountRegistry on-chain
+    // Strategy 2: On-chain registry scan
     match find_account_by_delegate_key(
         &state.http_client,
         &state.config.sui_rpc_url,
@@ -182,7 +230,6 @@ async fn resolve_account(
     .await
     {
         Ok((account_id, owner)) => {
-            // Cache for future requests
             let _ = state.db.cache_delegate_key(public_key_hex, &account_id, &owner).await;
             return Ok((account_id, owner));
         }
@@ -191,7 +238,7 @@ async fn resolve_account(
         }
     }
 
-    // Strategy 3: Use header hint or config fallback
+    // Strategy 3: Header hint or config fallback
     let fallback_account_id = account_id_hint
         .or_else(|| state.config.memwal_account_id.clone())
         .ok_or_else(|| "no account found: not in cache, registry, or header".to_string())?;
@@ -203,10 +250,17 @@ async fn resolve_account(
         pk_bytes,
     )
     .await
-    .map_err(|e| format!("fallback account {} verification failed: {}", fallback_account_id, e))?;
+    .map_err(|e| {
+        format!(
+            "fallback account {} verification failed: {}",
+            fallback_account_id, e
+        )
+    })?;
 
-    // Cache for future requests
-    let _ = state.db.cache_delegate_key(public_key_hex, &fallback_account_id, &owner).await;
+    let _ = state
+        .db
+        .cache_delegate_key(public_key_hex, &fallback_account_id, &owner)
+        .await;
 
     Ok((fallback_account_id, owner))
 }
