@@ -235,6 +235,11 @@ async function main() {
         console.log('\n  waiting 3s for Walrus propagation...')
         await new Promise(r => setTimeout(r, 3000))
         await testRecall(blobId)
+        const cooldown = Number(process.env.RATE_LIMIT_COOLDOWN_MS ?? 65_000)
+        if (cooldown > 0) {
+            console.log(`\n  cooling down ${cooldown / 1000}s so delegate-key rate limit refills...`)
+            await new Promise(r => setTimeout(r, cooldown))
+        }
         await testAnalyze()
         console.log('\nE2E test passed\n')
     } catch (err) {
