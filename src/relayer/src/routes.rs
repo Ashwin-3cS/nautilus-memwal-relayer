@@ -1,18 +1,133 @@
-use axum::{extract::State, Extension, Json};
+use axum::{extract::{Path, State}, Extension, Json};
 use axum::body::Body;
+use axum::http::StatusCode;
 use axum::response::Response;
 use base64::Engine as _;
+use futures::stream::{self, StreamExt};
 use std::sync::Arc;
+
+use apalis::prelude::Storage as _;
 
 use crate::enclave::{
     sign_response, INTENT_ANALYZE, INTENT_ASK, INTENT_RECALL, INTENT_RECALL_MANUAL,
     INTENT_REMEMBER, INTENT_REMEMBER_MANUAL, INTENT_RESTORE,
 };
+use crate::jobs::{WalletJob, WalletOperation};
 use crate::seal;
 use crate::walrus;
 use crate::rate_limit;
 use crate::types::*;
 use crate::db::VectorDb;
+
+/// Enqueue a WalletJob to the single shared Apalis queue (MEM-35).
+/// `wallet_index` is retained in payload for audit; jobs route via one queue.
+pub async fn enqueue_wallet_job(
+    state: &AppState,
+    wallet_index: usize,
+    operation: WalletOperation,
+) -> Result<usize, AppError> {
+    let mut storage = state.wallet_storage.clone();
+    storage
+        .push(WalletJob {
+            wallet_index,
+            operation,
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to enqueue WalletJob: {}", e)))?;
+    Ok(wallet_index)
+}
+
+async fn mark_remember_job_failed(state: &AppState, job_id: &str, msg: &str) {
+    let _ = sqlx::query(
+        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(msg)
+    .bind(job_id)
+    .execute(state.db.pool())
+    .await;
+}
+
+#[allow(dead_code)]
+async fn mark_remember_jobs_failed(state: &AppState, job_ids: &[String], msg: &str) {
+    if job_ids.is_empty() {
+        return;
+    }
+    let _ = sqlx::query(
+        "UPDATE remember_jobs SET status = 'failed', error_msg = $1, updated_at = NOW() WHERE id = ANY($2)",
+    )
+    .bind(msg)
+    .bind(job_ids)
+    .execute(state.db.pool())
+    .await;
+}
+
+/// Spawn an async task that does embed + encrypt for a single fact/text,
+/// then enqueues a WalletJob::UploadAndTransfer for the wallet worker.
+fn spawn_prepare_remember_job(
+    state: Arc<AppState>,
+    job_id: String,
+    text: String,
+    owner: String,
+    namespace: String,
+    agent_public_key: Option<String>,
+) {
+    tokio::spawn(async move {
+        let result: Result<(), AppError> = async {
+            let embed_fut = generate_embedding(&state.http_client, &state.config, &text);
+            let encrypt_fut = crate::seal::seal_encrypt(
+                &state.http_client,
+                &state.config.sidecar_url,
+                state.config.sidecar_secret.as_deref(),
+                text.as_bytes(),
+                &owner,
+                &state.config.package_id,
+            );
+            let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
+            let vector = vector_result?;
+            let encrypted = encrypted_result?;
+
+            rate_limit::check_storage_quota(&state, &owner, encrypted.len() as i64).await?;
+
+            let wallet_index = state.key_pool.next_index().ok_or_else(|| {
+                AppError::Internal("No Sui keys configured".into())
+            })?;
+            let encrypted_b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+
+            enqueue_wallet_job(
+                &state,
+                wallet_index,
+                WalletOperation::UploadAndTransfer {
+                    encrypted_b64,
+                    vector,
+                    owner: owner.clone(),
+                    namespace: namespace.clone(),
+                    package_id: state.config.package_id.clone(),
+                    agent_public_key: agent_public_key.clone(),
+                    remember_job_id: Some(job_id.clone()),
+                    epochs: 50,
+                },
+            )
+            .await?;
+
+            tracing::info!(
+                "remember prepared: job_id={} owner={} ns={} encrypted_bytes={} wallet={}",
+                job_id,
+                owner,
+                namespace,
+                encrypted.len(),
+                wallet_index,
+            );
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            let msg = e.to_string();
+            tracing::error!("remember preparation failed: job_id={} {}", job_id, msg);
+            mark_remember_job_failed(&state, &job_id, &msg).await;
+        }
+    });
+}
 
 /// Truncate a string to at most `max_bytes` bytes without splitting a UTF-8
 /// character.  Falls back to the nearest char boundary when `max_bytes` lands
@@ -27,6 +142,10 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+const MAX_REMEMBER_TEXT_BYTES: usize = 64 * 1024;
+const MAX_BULK_ITEMS: usize = 20;
+const BULK_EMBED_CONCURRENCY: usize = 5;
 
 // ============================================================
 // Embedding — OpenRouter/OpenAI API (with mock fallback)
@@ -119,56 +238,174 @@ pub async fn remember(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RememberRequest>,
-) -> Result<Json<SignedResponse<RememberResponse>>, AppError> {
+) -> Result<(StatusCode, Json<SignedResponse<RememberAcceptedResponse>>), AppError> {
     if body.text.is_empty() {
         return Err(AppError::BadRequest("Text cannot be empty".into()));
     }
+    if body.text.len() > MAX_REMEMBER_TEXT_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "text exceeds maximum of {} bytes", MAX_REMEMBER_TEXT_BYTES
+        )));
+    }
 
-    // Owner is derived from delegate key via onchain verification (auth middleware)
     let owner = &auth.owner;
     let text = &body.text;
     let namespace = &body.namespace;
     tracing::info!("remember: text=\"{}...\" owner={} ns={}", truncate_str(text, 50), owner, namespace);
 
-    // Check storage quota before processing
-    let text_bytes = text.as_bytes().len() as i64;
-    rate_limit::check_storage_quota(&state, owner, text_bytes).await?;
-
-    // Step 1: Embed text + SEAL encrypt concurrently (they're independent)
-    let embed_fut = generate_embedding(&state.http_client, &state.config, text);
-    let encrypt_fut = seal::seal_encrypt(
-        &state.http_client, &state.config.sidecar_url,
-        text.as_bytes(), owner, &state.config.package_id,
-    );
-    let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
-    let vector = vector_result?;
-    let encrypted = encrypted_result?;
-
-    // Step 2: Upload encrypted blob → Walrus (via sidecar)
-    let sui_key = state.key_pool.next()
-        .map(|s| s.to_string())
-        .ok_or_else(|| AppError::Internal("No Sui keys configured (set SERVER_SUI_PRIVATE_KEYS or SERVER_SUI_PRIVATE_KEY)".into()))?;
-    let upload_result = walrus::upload_blob(
-        &state.http_client, &state.config.sidecar_url,
-        &encrypted, 50, owner, &sui_key, namespace, &state.config.package_id,
-    ).await?;
-    let blob_id = upload_result.blob_id;
-
-    // Step 3: Store {vector, blobId, namespace} in Vector DB
-    let blob_size = encrypted.len() as i64;
+    // Insert remember_jobs row (status='pending') so the client has something to poll.
     let id = uuid::Uuid::new_v4().to_string();
-    state.db.insert_vector(&id, owner, namespace, &blob_id, &vector, blob_size).await?;
+    sqlx::query(
+        "INSERT INTO remember_jobs (id, owner, namespace, status) VALUES ($1, $2, $3, 'pending')",
+    )
+    .bind(&id)
+    .bind(owner)
+    .bind(namespace)
+    .execute(state.db.pool())
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to create remember job row: {}", e)))?;
 
-    tracing::info!(
-        "remember complete: blob_id={}, owner={}, ns={}, dims={}",
-        blob_id, owner, namespace, vector.len()
+    // Spawn async prep: embed + encrypt + enqueue WalletJob. Worker handles
+    // the Walrus upload with retries on transient lock errors.
+    spawn_prepare_remember_job(
+        Arc::clone(&state),
+        id.clone(),
+        text.clone(),
+        owner.clone(),
+        namespace.clone(),
+        Some(auth.public_key.clone()),
     );
 
-    Ok(Json(sign_response(&state.eph_kp, INTENT_REMEMBER, RememberResponse {
-        id,
+    tracing::info!("remember accepted: job_id={} owner={} ns={}", id, owner, namespace);
+
+    Ok((StatusCode::ACCEPTED, Json(sign_response(&state.eph_kp, INTENT_REMEMBER, RememberAcceptedResponse {
+        job_id: id,
+        status: "pending".into(),
+    }))))
+}
+
+/// GET /api/remember/:job_id — poll job status
+/// Returns plain JSON (not SignedResponse) so the SDK's waitForRememberJob works directly.
+pub async fn remember_status(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Path(job_id): Path<String>,
+) -> Result<Json<RememberJobStatusResponse>, AppError> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, String, String, String, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, owner, namespace, status, blob_id, error_msg FROM remember_jobs WHERE id = $1",
+        )
+        .bind(&job_id)
+        .fetch_optional(state.db.pool())
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {}", e)))?;
+
+    // Collapse "not found" and "not yours" into the same 404 (prevent enumeration)
+    let (id, _owner_db, namespace, status, blob_id, error_msg) = match row {
+        Some(r) if r.1 == auth.owner => r,
+        _ => return Err(AppError::BlobNotFound(format!("job {} not found", job_id))),
+    };
+
+    Ok(Json(RememberJobStatusResponse {
+        job_id: id,
+        status,
+        owner: auth.owner.clone(),
+        namespace,
         blob_id,
-        owner: owner.clone(),
-        namespace: namespace.clone(),
+        error: error_msg,
+    }))
+}
+
+/// POST /api/remember/bulk — remember multiple texts in one call
+/// Each item is processed synchronously (nautilus is sync) but concurrently via buffer_unordered.
+/// Returns plain JSON with job_ids; poll each via GET /api/remember/:job_id.
+pub async fn remember_bulk(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(body): Json<RememberBulkRequest>,
+) -> Result<(StatusCode, Json<RememberBulkAcceptedResponse>), AppError> {
+    if body.items.is_empty() {
+        return Err(AppError::BadRequest("items cannot be empty".into()));
+    }
+    if body.items.len() > MAX_BULK_ITEMS {
+        return Err(AppError::BadRequest(format!(
+            "items exceeds maximum of {}", MAX_BULK_ITEMS
+        )));
+    }
+    for (i, item) in body.items.iter().enumerate() {
+        if item.text.is_empty() {
+            return Err(AppError::BadRequest(format!("items[{}].text cannot be empty", i)));
+        }
+        if item.text.len() > MAX_REMEMBER_TEXT_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "items[{}].text exceeds {} bytes", i, MAX_REMEMBER_TEXT_BYTES
+            )));
+        }
+    }
+
+    let owner = auth.owner.clone();
+    tracing::info!("remember_bulk: {} items owner={}", body.items.len(), owner);
+
+    let total = body.items.len();
+    let job_ids: Vec<String> = (0..total).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+
+    // Pre-create all job rows
+    for (i, item) in body.items.iter().enumerate() {
+        state.db.insert_remember_job(&job_ids[i], &owner, &item.namespace).await?;
+    }
+
+    // Process all items concurrently with bounded parallelism
+    let items_with_ids: Vec<(String, RememberBulkItem)> = job_ids.clone()
+        .into_iter()
+        .zip(body.items.into_iter())
+        .collect();
+
+    let state_arc = Arc::clone(&state);
+    let owner_clone = owner.clone();
+
+    stream::iter(items_with_ids.into_iter())
+        .map(|(id, item)| {
+            let state = Arc::clone(&state_arc);
+            let owner = owner_clone.clone();
+            async move {
+                let key_index = state.key_pool.next_index()
+                    .ok_or_else(|| AppError::Internal("No Sui keys configured".into()))?;
+
+                let embed_fut = generate_embedding(&state.http_client, &state.config, &item.text);
+                let encrypt_fut = seal::seal_encrypt(
+                    &state.http_client, &state.config.sidecar_url,
+                    state.config.sidecar_secret.as_deref(),
+                    item.text.as_bytes(), &owner, &state.config.package_id,
+                );
+                let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
+                let vector = vector_result?;
+                let encrypted = encrypted_result?;
+
+                let upload_result = walrus::upload_blob(
+                    &state.http_client, &state.config.sidecar_url,
+                    state.config.sidecar_secret.as_deref(),
+                    &encrypted, 50, &owner, key_index, &item.namespace, &state.config.package_id, None,
+                ).await?;
+
+                let blob_size = encrypted.len() as i64;
+                state.db.insert_vector(&id, &owner, &item.namespace, &upload_result.blob_id, &vector, blob_size).await?;
+                state.db.complete_remember_job(&id, &upload_result.blob_id).await?;
+
+                tracing::info!("bulk item done: job_id={} blob_id={}", id, upload_result.blob_id);
+                Ok::<(), AppError>(())
+            }
+        })
+        .buffer_unordered(BULK_EMBED_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    tracing::info!("remember_bulk queued: {} jobs for owner={}", total, owner);
+
+    Ok((StatusCode::ACCEPTED, Json(RememberBulkAcceptedResponse {
+        job_ids,
+        total,
+        status: "accepted".into(),
     })))
 }
 
@@ -213,19 +450,19 @@ pub async fn recall(
         let walrus_client = &state.walrus_client;
         let http_client = &state.http_client;
         let sidecar_url = state.config.sidecar_url.clone();
+        let sidecar_secret = state.config.sidecar_secret.clone();
         let blob_id = hit.blob_id.clone();
         let distance = hit.distance;
         let private_key = private_key.to_string();
         let package_id = state.config.package_id.clone();
         let account_id = auth.account_id.clone();
+        let owner = owner.clone();
         async move {
-            // Download encrypted blob from Walrus (native Rust)
             let encrypted_data = match walrus::download_blob(walrus_client, &blob_id).await {
                 Ok(data) => data,
                 Err(AppError::BlobNotFound(msg)) => {
-                    // Blob expired on Walrus — clean up from DB reactively
                     tracing::warn!("Blob expired, cleaning up: {}", msg);
-                    cleanup_expired_blob(db, &blob_id).await;
+                    cleanup_expired_blob(db, &blob_id, &owner).await;
                     return None;
                 }
                 Err(e) => {
@@ -233,8 +470,7 @@ pub async fn recall(
                     return None;
                 }
             };
-            // Decrypt using SEAL (via sidecar HTTP)
-            match seal::seal_decrypt(http_client, &sidecar_url, &encrypted_data, &private_key, &package_id, &account_id).await {
+            match seal::seal_decrypt(http_client, &sidecar_url, sidecar_secret.as_deref(), &encrypted_data, &private_key, &package_id, &account_id).await {
                 Ok(plaintext) => {
                     match String::from_utf8(plaintext) {
                         Ok(text) => Some(RecallResult { blob_id, text, distance }),
@@ -250,7 +486,7 @@ pub async fn recall(
                         || err_str.contains("decrypt failed");
                     if is_permanent {
                         tracing::warn!("SEAL decrypt permanently failed for blob {}, cleaning up: {}", blob_id, e);
-                        cleanup_expired_blob(db, &blob_id).await;
+                        cleanup_expired_blob(db, &blob_id, &owner).await;
                     } else {
                         tracing::warn!("Failed to SEAL decrypt blob {}: {}", blob_id, e);
                     }
@@ -309,19 +545,20 @@ pub async fn remember_manual(
     rate_limit::check_storage_quota(&state, owner, encrypted_bytes.len() as i64).await?;
 
     // Upload encrypted bytes to Walrus via sidecar (pool key pays gas)
-    let sui_key = state.key_pool.next()
-        .map(|s| s.to_string())
+    let key_index = state.key_pool.next_index()
         .ok_or_else(|| AppError::Internal("No Sui keys configured (set SERVER_SUI_PRIVATE_KEYS or SERVER_SUI_PRIVATE_KEY)".into()))?;
 
     let upload = walrus::upload_blob(
         &state.http_client,
         &state.config.sidecar_url,
+        state.config.sidecar_secret.as_deref(),
         &encrypted_bytes,
         50,
         owner,
-        &sui_key,
+        key_index,
         namespace,
         &state.config.package_id,
+        None,
     )
     .await?;
 
@@ -387,7 +624,7 @@ pub async fn analyze(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<AnalyzeRequest>,
-) -> Result<Json<SignedResponse<AnalyzeResponse>>, AppError> {
+) -> Result<(StatusCode, Json<SignedResponse<AnalyzeAcceptedResponse>>), AppError> {
     if body.text.is_empty() {
         return Err(AppError::BadRequest("Text cannot be empty".into()));
     }
@@ -396,82 +633,67 @@ pub async fn analyze(
     let namespace = &body.namespace;
     tracing::info!("analyze: text=\"{}...\" owner={} ns={}", truncate_str(&body.text, 50), owner, namespace);
 
-    // Step 1: Extract facts using LLM
+    // Step 1: Extract facts using LLM (synchronous — ~1-2s)
     let facts = extract_facts_llm(&state.http_client, &state.config, &body.text).await?;
     tracing::info!("  → Extracted {} facts", facts.len());
 
     if facts.is_empty() {
-        return Ok(Json(sign_response(&state.eph_kp, INTENT_ANALYZE, AnalyzeResponse {
+        return Ok((StatusCode::ACCEPTED, Json(sign_response(&state.eph_kp, INTENT_ANALYZE, AnalyzeAcceptedResponse {
+            job_ids: vec![],
             facts: vec![],
-            total: 0,
+            fact_count: 0,
+            status: "pending".into(),
             owner: owner.clone(),
-        })));
+        }))));
     }
 
-    // Check storage quota before processing all facts
-    let total_text_bytes: i64 = facts.iter().map(|f| f.as_bytes().len() as i64).sum();
-    rate_limit::check_storage_quota(&state, owner, total_text_bytes).await?;
+    // Step 2: For each fact, insert a remember_jobs row and spawn an async
+    // prep task that does embed+encrypt then enqueues a WalletJob. The
+    // wallet worker handles upload+transfer with retry on transient errors
+    // (e.g. coin-object locks).
+    let agent_pubkey = auth.public_key.clone();
+    let mut job_ids: Vec<String> = Vec::with_capacity(facts.len());
+    let mut accepted_facts: Vec<AnalyzeAcceptedFact> = Vec::with_capacity(facts.len());
 
-    // Step 2: Process all facts concurrently (embed + encrypt → upload → store)
-    // Each fact gets its own key from the pool so sidecar can upload them in parallel
-    // (different signer addresses bypass the per-signer serialization lock).
-    let tasks: Vec<_> = facts.iter().map(|fact_text| {
-        let state = Arc::clone(&state);
-        let owner = owner.clone();
-        let fact_text = fact_text.clone();
-        // Pick the next key in round-robin order at task construction time.
-        // Convert to owned String *before* async move so we don't borrow-then-move `state`.
-        let sui_key: Result<String, AppError> = state.key_pool.next()
-            .map(|s| s.to_string())
-            .ok_or_else(|| AppError::Internal("No Sui keys configured (set SERVER_SUI_PRIVATE_KEYS or SERVER_SUI_PRIVATE_KEY)".into()));
-        let namespace = namespace.clone();
-        async move {
-            let sui_key = sui_key?;
-            // Embed + SEAL encrypt concurrently (independent operations)
-            let embed_fut = generate_embedding(&state.http_client, &state.config, &fact_text);
-            let encrypt_fut = seal::seal_encrypt(
-                &state.http_client, &state.config.sidecar_url,
-                fact_text.as_bytes(), &owner, &state.config.package_id,
-            );
-            let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
-            let vector = vector_result?;
-            let encrypted = encrypted_result?;
+    for fact_text in &facts {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO remember_jobs (id, owner, namespace, status) VALUES ($1, $2, $3, 'pending')",
+        )
+        .bind(&job_id)
+        .bind(owner)
+        .bind(namespace)
+        .execute(state.db.pool())
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create analyze job row: {}", e)))?;
 
-            // Upload to Walrus (via sidecar HTTP)
-            let upload_result = walrus::upload_blob(
-                &state.http_client, &state.config.sidecar_url,
-                &encrypted, 50, &owner, &sui_key, &namespace, &state.config.package_id,
-            ).await?;
+        spawn_prepare_remember_job(
+            Arc::clone(&state),
+            job_id.clone(),
+            fact_text.clone(),
+            owner.clone(),
+            namespace.clone(),
+            Some(agent_pubkey.clone()),
+        );
 
-            // Store in Vector DB with namespace
-            let blob_size = encrypted.len() as i64;
-            let id = uuid::Uuid::new_v4().to_string();
-            state.db.insert_vector(&id, &owner, &namespace, &upload_result.blob_id, &vector, blob_size).await?;
-
-            Ok::<AnalyzedFact, AppError>(AnalyzedFact {
-                text: fact_text,
-                id,
-                blob_id: upload_result.blob_id,
-            })
-        }
-    }).collect();
-
-    let results = futures::future::join_all(tasks).await;
-
-    // Collect successes, fail on first error (same semantics as sequential version)
-    let mut stored_facts = Vec::with_capacity(results.len());
-    for result in results {
-        stored_facts.push(result?);
+        accepted_facts.push(AnalyzeAcceptedFact {
+            text: fact_text.clone(),
+            id: job_id.clone(),
+            job_id: job_id.clone(),
+        });
+        job_ids.push(job_id);
     }
 
-    let total = stored_facts.len();
-    tracing::info!("analyze complete: {} facts stored for owner={}", total, owner);
+    let fact_count = job_ids.len();
+    tracing::info!("analyze accepted: {} facts enqueued owner={} ns={}", fact_count, owner, namespace);
 
-    Ok(Json(sign_response(&state.eph_kp, INTENT_ANALYZE, AnalyzeResponse {
-        facts: stored_facts,
-        total,
+    Ok((StatusCode::ACCEPTED, Json(sign_response(&state.eph_kp, INTENT_ANALYZE, AnalyzeAcceptedResponse {
+        job_ids,
+        facts: accepted_facts,
+        fact_count,
+        status: "pending".into(),
         owner: owner.clone(),
-    })))
+    }))))
 }
 
 // ============================================================
@@ -640,18 +862,19 @@ pub async fn ask(
         let walrus_client = &state.walrus_client;
         let http_client = &state.http_client;
         let sidecar_url = state.config.sidecar_url.clone();
+        let sidecar_secret = state.config.sidecar_secret.clone();
         let blob_id = hit.blob_id.clone();
         let distance = hit.distance;
         let private_key = private_key.to_string();
         let package_id = state.config.package_id.clone();
         let account_id = auth.account_id.clone();
+        let owner = owner.clone();
         async move {
             let encrypted_data = match walrus::download_blob(walrus_client, &blob_id).await {
                 Ok(data) => data,
                 Err(AppError::BlobNotFound(msg)) => {
-                    // Blob expired on Walrus — clean up from DB reactively
                     tracing::warn!("Blob expired, cleaning up: {}", msg);
-                    cleanup_expired_blob(db, &blob_id).await;
+                    cleanup_expired_blob(db, &blob_id, &owner).await;
                     return None;
                 }
                 Err(e) => {
@@ -659,7 +882,7 @@ pub async fn ask(
                     return None;
                 }
             };
-            match seal::seal_decrypt(http_client, &sidecar_url, &encrypted_data, &private_key, &package_id, &account_id).await {
+            match seal::seal_decrypt(http_client, &sidecar_url, sidecar_secret.as_deref(), &encrypted_data, &private_key, &package_id, &account_id).await {
                 Ok(plaintext) => {
                     match String::from_utf8(plaintext) {
                         Ok(text) => Some(RecallResult { blob_id, text, distance }),
@@ -750,19 +973,13 @@ pub async fn ask(
 /// Reactively delete an expired blob from the vector DB.
 /// Called when Walrus returns 404 (blob expired / not found).
 /// Errors are logged but not propagated — cleanup is best-effort.
-async fn cleanup_expired_blob(db: &VectorDb, blob_id: &str) {
-    match db.delete_by_blob_id(blob_id).await {
+async fn cleanup_expired_blob(db: &VectorDb, blob_id: &str, owner: &str) {
+    match db.delete_by_blob_id(blob_id, owner).await {
         Ok(rows) => {
-            tracing::info!(
-                "reactive cleanup: deleted {} vector entries for expired blob_id={}",
-                rows, blob_id
-            );
+            tracing::info!("reactive cleanup: deleted {} entries for expired blob_id={}", rows, blob_id);
         }
         Err(e) => {
-            tracing::error!(
-                "reactive cleanup failed for blob_id={}: {}",
-                blob_id, e
-            );
+            tracing::error!("reactive cleanup failed for blob_id={}: {}", blob_id, e);
         }
     }
 }
@@ -806,6 +1023,7 @@ pub async fn restore(
     let on_chain_blobs = walrus::query_blobs_by_owner(
         &state.http_client,
         &state.config.sidecar_url,
+        state.config.sidecar_secret.as_deref(),
         owner,
         Some(namespace),
         Some(&state.config.package_id),
@@ -864,12 +1082,13 @@ pub async fn restore(
     let download_tasks: Vec<_> = missing_blob_ids.iter().map(|blob_id| {
         let walrus_client = &state.walrus_client;
         let blob_id = blob_id.clone();
+        let owner = owner.clone();
         async move {
             match walrus::download_blob(walrus_client, &blob_id).await {
                 Ok(data) => Some((blob_id, data)),
                 Err(AppError::BlobNotFound(msg)) => {
                     tracing::warn!("restore: blob expired, skipping: {}", msg);
-                    cleanup_expired_blob(db, &blob_id).await;
+                    cleanup_expired_blob(db, &blob_id, &owner).await;
                     None
                 }
                 Err(e) => {
@@ -911,6 +1130,7 @@ pub async fn restore(
         .map(|(blob_id, encrypted_data)| {
             let http_client = &state.http_client;
             let sidecar_url = state.config.sidecar_url.clone();
+            let sidecar_secret = state.config.sidecar_secret.clone();
             let private_key = private_key.clone();
             // Use the package_id that was stored with this blob (supports contract upgrades)
             let package_id = blob_package_ids.get(&blob_id)
@@ -919,7 +1139,7 @@ pub async fn restore(
             let account_id = auth.account_id.clone();
             async move {
                 match seal::seal_decrypt(
-                    http_client, &sidecar_url, &encrypted_data,
+                    http_client, &sidecar_url, sidecar_secret.as_deref(), &encrypted_data,
                     &private_key, &package_id, &account_id,
                 ).await {
                     Ok(plaintext) => {
@@ -996,6 +1216,15 @@ pub async fn restore(
         namespace: namespace.clone(),
         owner: owner.clone(),
     })))
+}
+
+/// GET /config — public network config (no auth required)
+pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
+    Json(ConfigResponse {
+        package_id: state.config.package_id.clone(),
+        network: state.config.sui_network.clone(),
+        sui_rpc_url: state.config.sui_rpc_url.clone(),
+    })
 }
 
 // ============================================================
