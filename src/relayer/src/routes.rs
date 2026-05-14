@@ -558,7 +558,7 @@ pub async fn remember_manual(
         key_index,
         namespace,
         &state.config.package_id,
-        None,
+        Some(&auth.public_key),
     )
     .await?;
 
